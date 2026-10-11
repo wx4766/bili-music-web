@@ -1,0 +1,20 @@
+# 运行期数据：收藏夹 / 播放历史 / 音频缓存（含个人隐私，绝不入库）
+data/
+data-test/
+*.log
+
+# 代码备份（开发过程中的 .bak-* 快照）
+*.bak-*
+
+# 构建产物
+fpk/app/
+*.fpk
+
+# 依赖与环境
+node_modules/
+.env
+.env.*
+
+# 系统文件
+.DS_Store
+Thumbs.db

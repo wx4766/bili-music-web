@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>B站音乐 · 随身听 — Draft A / Pure-CSS Art</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;900&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   DRAFT A · 纯 CSS 几何插画 (Pure-CSS Art)
+   色板（4 色，角色明确）:
+     ink   #16141A  底 · 近黑底色
+     ink2  #211E28  底 · 表面抬升（ink 的同族浅一档）
+     cream #F4EEE1  主 · 文字与主几何
+     pink  #FB7299  accent · B站粉，正在播/高亮/母题标签
+     blue  #23ADE5  accent2 · B站蓝，辅助切片/徽标
+   规则: 无渐变 / 无阴影 / 无毛玻璃 / 无圆角卡片+左彩条
+   ============================================================ */
+:root{
+  --ink:#16141A;
+  --ink2:#211E28;
+  --ink3:#2C2836;
+  --cream:#F4EEE1;
+  --pink:#FB7299;
+  --blue:#23ADE5;
+  --sans:'Archivo',-apple-system,BlinkPingFang,'PingFang SC','HarmonyOS Sans SC','Noto Sans SC','Microsoft YaHei',sans-serif;
+  --safe-b:env(safe-area-inset-bottom,0px);
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+html{-webkit-text-size-adjust:100%;}
+body{
+  background:var(--ink);
+  color:var(--cream);
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.5;
+  overflow-x:hidden;
+}
+img{display:block;}
+
+/* ---------- 背景几何装饰（fixed，纯形状，不挡内容） ---------- */
+.bg-geo{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;}
+.bg-geo .g-circle{
+  position:absolute;right:-140px;top:-140px;
+  width:320px;height:320px;border-radius:50%;
+  border:26px solid var(--pink);
+}
+.bg-geo .g-square{
+  position:absolute;left:-70px;bottom:180px;
+  width:190px;height:190px;
+  background:var(--blue);
+  transform:rotate(18deg);
+  opacity:.9;
+}
+.bg-geo .g-line{
+  position:absolute;left:24px;top:0;bottom:0;width:2px;
+  background:var(--ink3);
+}
+.bg-geo .g-line.l2{left:auto;right:20px;top:auto;height:120px;bottom:120px;width:2px;}
+.bg-geo .g-dots{
+  position:absolute;left:18px;top:340px;width:8px;height:8px;background:var(--cream);
+  box-shadow:0 18px 0 var(--ink3),0 36px 0 var(--ink3);
+}
+
+/* ---------- 通用几何按钮（触控≥44px） ---------- */
+.gbtn{
+  width:48px;height:48px;min-width:48px;
+  border:2px solid var(--cream);
+  background:transparent;
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;
+  position:relative;
+}
+.gbtn:active{background:var(--cream);}
+.gbtn:active .ic{border-color:var(--ink);}
+.gbtn.pink{background:var(--pink);border-color:var(--pink);}
+.gbtn.pink:active{background:var(--cream);border-color:var(--cream);}
+
+/* 纯 CSS 图标形状 */
+.ic-play{width:0;height:0;border-style:solid;border-width:10px 0 10px 16px;border-color:transparent transparent transparent var(--cream);margin-left:4px;}
+.ic-pause::before,.ic-pause::after{content:"";position:absolute;top:13px;width:6px;height:22px;background:var(--cream);}
+.ic-pause::before{left:14px;}
+.ic-pause::after{right:14px;}
+.ic-next{display:flex;align-items:center;gap:3px;}
+.ic-next .tri{width:0;height:0;border-style:solid;border-width:9px 0 9px 14px;border-color:transparent transparent transparent var(--cream);}
+.ic-next .bar{width:4px;height:18px;background:var(--cream);}
+.ic-prev{display:flex;align-items:center;gap:3px;}
+.ic-prev .tri{width:0;height:0;border-style:solid;border-width:9px 14px 9px 0;border-color:transparent var(--cream) transparent transparent;}
+.ic-prev .bar{width:4px;height:18px;background:var(--cream);}
+.ic-heart{
+  width:26px;height:24px;background:var(--pink);
+  clip-path:polygon(50% 100%,0 38%,6% 12%,26% 2%,50% 18%,74% 2%,94% 12%,100% 38%);
+}
+.ic-search{position:relative;width:22px;height:22px;}
+.ic-search::before{content:"";position:absolute;inset:0 6px 6px 0;border:4px solid var(--ink);border-radius:50%;}
+.ic-search::after{content:"";position:absolute;right:0;bottom:0;width:10px;height:4px;background:var(--ink);transform:rotate(45deg);transform-origin:right bottom;}
+
+/* ---------- 旋转黑胶唱片 · 几何母题（签名细节） ----------
+   结构: 唱片外环(ink) → 中环(cream) → 音轨环(ink3) → 标签(pink/封面) → 中孔(ink)
+   无渐变，全部 border-radius + 嵌套圆 */
+.disc{position:relative;border-radius:50%;flex-shrink:0;}
+.disc .d-ring1{position:absolute;inset:0;border-radius:50%;background:var(--ink);border:3px solid var(--cream);}
+.disc .d-ring2{position:absolute;inset:14%;border-radius:50%;background:var(--ink3);}
+.disc .d-ring3{position:absolute;inset:22%;border-radius:50%;border:2px dashed var(--cream);opacity:.55;}
+.disc .d-label{position:absolute;inset:30%;border-radius:50%;background:var(--pink);overflow:hidden;}
+.disc .d-label img{width:100%;height:100%;object-fit:cover;border-radius:50%;}
+.disc .d-label.plain{display:block;}
+.disc .d-hole{position:absolute;inset:46%;border-radius:50%;background:var(--ink);}
+.disc .d-marker{position:absolute;left:50%;top:5%;width:7%;height:7%;margin-left:-3.5%;border-radius:50%;background:var(--cream);}
+/* 旋转: 只转内芯与标记，外环静止 */
+.disc .d-spin{position:absolute;inset:0;animation:spin 3.2s linear infinite;}
+.paused .disc .d-spin{animation-play-state:paused;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* ---------- 品牌区 ---------- */
+main{position:relative;z-index:1;}
+.brand{
+  padding:calc(env(safe-area-inset-top,0px) + 22px) 22px 8px;
+  display:flex;align-items:flex-start;justify-content:space-between;
+}
+.brand .b-chip{
+  display:inline-flex;align-items:center;gap:8px;
+  background:var(--blue);color:var(--ink);
+  font-weight:900;font-size:13px;letter-spacing:.08em;
+  padding:7px 12px;
+}
+.brand .b-chip .chip-sq{width:10px;height:10px;background:var(--ink);}
+.brand .b-note{
+  margin-top:14px;font-size:12px;color:var(--cream);
+  border:2px solid var(--ink3);padding:5px 10px;
+  letter-spacing:.14em;font-weight:700;color:var(--cream);
+}
+.hero{padding:6px 22px 18px;position:relative;}
+.hero h1{
+  font-weight:900;
+  font-size:88px;
+  line-height:.94;
+  letter-spacing:-.02em;
+  color:var(--cream);
+}
+.hero h1 .hl{
+  color:var(--ink);
+  background:var(--pink);
+  padding:0 10px 4px 0;
+  display:inline-block;
+}
+.hero .sub{
+  margin-top:16px;
+  display:flex;align-items:center;gap:12px;
+  font-weight:700;font-size:14px;letter-spacing:.2em;
+}
+.hero .sub .rule{flex:1;height:3px;background:var(--pink);}
+.hero .sub .sq{width:12px;height:12px;background:var(--blue);}
+/* 品牌区的小唱片 */
+.brand-disc{width:64px;height:64px;}
+
+/* ---------- 搜索区 ---------- */
+.search{
+  margin:10px 22px 0;
+  display:flex;gap:10px;
+}
+.search .field{
+  flex:1;height:52px;
+  border:3px solid var(--cream);
+  background:var(--ink);
+  color:var(--cream);
+  font:700 15px var(--sans);
+  padding:0 14px;
+  letter-spacing:.04em;
+}
+.search .field::placeholder{color:var(--cream);opacity:.5;}
+.search .go{
+  width:52px;height:52px;min-width:52px;
+  border:none;background:var(--pink);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;
+}
+.search .go:active{background:var(--cream);}
+
+/* ---------- 结果条 + 列表 ---------- */
+.strip{
+  margin:26px 0 0;
+  background:var(--blue);
+  color:var(--ink);
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 22px;
+  font-weight:900;font-size:14px;letter-spacing:.12em;
+}
+.strip .count{
+  font-weight:900;font-size:12px;
+  border:2px solid var(--ink);
+  padding:1px 8px;
+}
+.list{padding-bottom:calc(120px + var(--safe-b));}
+.row{
+  display:grid;
+  grid-template-columns:60px 1fr auto;
+  gap:14px;
+  align-items:center;
+  padding:14px 22px;
+  border-bottom:2px solid var(--ink3);
+  cursor:pointer;
+}
+.row .cov{
+  width:60px;height:60px;
+  border:3px solid var(--cream);
+  position:relative;
+  overflow:hidden;
+}
+.row .cov img{width:100%;height:100%;object-fit:cover;}
+.row .t{
+  font-weight:700;font-size:15px;line-height:1.35;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+}
+.row .a{
+  margin-top:4px;font-size:12px;font-weight:700;letter-spacing:.06em;
+  color:var(--cream);opacity:.72;
+}
+.row .meta{
+  display:flex;flex-direction:column;align-items:flex-end;gap:6px;
+}
+.chip{
+  font-weight:900;font-size:12px;letter-spacing:.05em;
+  padding:2px 8px;
+  background:var(--ink2);
+  color:var(--cream);
+  display:inline-flex;align-items:center;gap:5px;
+}
+.chip .tri{width:0;height:0;border-style:solid;border-width:4px 0 4px 6px;border-color:transparent transparent transparent var(--blue);}
+.chip.dur{background:var(--blue);color:var(--ink);}
+
+/* 正在播放行: 粉色整行反白 */
+.row.playing{
+  background:var(--pink);
+  border-bottom:2px solid var(--ink);
+  padding-top:16px;padding-bottom:16px;
+}
+.row.playing .cov{border-color:var(--ink);}
+.row.playing .t{color:var(--ink);}
+.row.playing .a{color:var(--ink);opacity:.85;}
+.row.playing .chip{background:var(--ink);color:var(--pink);}
+.row.playing .chip.dur{background:var(--cream);color:var(--ink);}
+.row.playing .chip.dur .tri{border-left-color:var(--ink);}
+.nowtag{
+  grid-column:1 / -1;
+  display:flex;align-items:center;gap:10px;
+  font-weight:900;font-size:12px;letter-spacing:.22em;
+  color:var(--ink);
+  margin-bottom:10px;
+}
+.nowtag .rule{width:26px;height:3px;background:var(--ink);}
+/* 几何均衡器（正在播指示） */
+.eq{display:flex;align-items:flex-end;gap:3px;height:16px;margin-left:2px;}
+.eq i{width:4px;background:var(--ink);animation:eq 0.9s ease-in-out infinite;}
+.eq i:nth-child(2){animation-delay:.2s;}
+.eq i:nth-child(3){animation-delay:.45s;}
+@keyframes eq{0%,100%{height:5px;}50%{height:16px;}}
+.paused .eq i{animation-play-state:paused;}
+
+/* ---------- 底部迷你播放条 ---------- */
+.mini{
+  position:fixed;left:0;right:0;bottom:0;z-index:30;
+  background:var(--cream);
+  color:var(--ink);
+  border-top:4px solid var(--ink);
+  padding:10px 14px calc(10px + var(--safe-b));
+  cursor:pointer;
+}
+.mini-in{
+  display:flex;align-items:center;gap:12px;
+}
+/* 迷你条母题: 唱片外环 + 真实封面作标签芯 */
+.mini-disc{width:56px;height:56px;}
+.mini-info{flex:1;min-width:0;}
+.mini-info .mt{
+  font-weight:900;font-size:14px;line-height:1.25;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.mini-info .ma{
+  font-weight:700;font-size:12px;letter-spacing:.06em;
+  margin-top:1px;opacity:.72;
+}
+.mini-prog{margin-top:6px;height:5px;background:var(--ink3);position:relative;}
+.mini-prog .fill{position:absolute;inset:0 auto 0 0;width:0%;background:var(--pink);}
+.mini-ctrl{display:flex;gap:8px;}
+.mini .gbtn{border-color:var(--ink);background:var(--ink);width:44px;height:44px;min-width:44px;}
+.mini .gbtn.pink{background:var(--pink);border-color:var(--ink);}
+.mini .ic-play{border-left-color:var(--cream);}
+.mini .ic-pause::before,.mini .ic-pause::after{background:var(--cream);}
+.mini .ic-next .tri,.mini .ic-prev .tri{border-color:transparent;}
+.mini .ic-next .tri{border-left-color:var(--cream);}
+.mini .ic-prev .tri{border-right-color:var(--cream);}
+.mini .ic-next .bar,.mini .ic-prev .bar{background:var(--cream);}
+/* 展开指示: 上指几何箭头 */
+.mini .exp{
+  position:absolute;top:-4px;left:50%;transform:translateX(-50%);
+  width:0;height:0;
+  border-left:9px solid transparent;border-right:9px solid transparent;
+  border-bottom:8px solid var(--pink);
+}
+
+/* ---------- 歌词全屏面板 ---------- */
+.lyrics{
+  position:fixed;inset:0;z-index:50;
+  background:var(--ink);
+  display:flex;flex-direction:column;
+  transform:translateY(102%);
+  transition:transform .38s cubic-bezier(.3,.9,.3,1);
+}
+.lyrics.open{transform:translateY(0);}
+/* 顶栏: 收起 + 唱片大母题 */
+.ly-top{
+  padding:calc(env(safe-area-inset-top,0px) + 16px) 22px 0;
+  display:flex;align-items:center;justify-content:space-between;
+}
+.ly-top .close{
+  width:48px;height:48px;border:2px solid var(--cream);background:transparent;cursor:pointer;position:relative;
+}
+.ly-top .close::before,.ly-top .close::after{
+  content:"";position:absolute;left:50%;top:50%;width:22px;height:3px;background:var(--cream);transform:translate(-50%,-50%) rotate(45deg);
+}
+.ly-top .close::after{transform:translate(-50%,-50%) rotate(-45deg);}
+.ly-top .ly-tag{
+  font-weight:900;font-size:12px;letter-spacing:.24em;
+  background:var(--blue);color:var(--ink);padding:6px 12px;
+}
+.ly-hero{
+  display:flex;align-items:center;gap:20px;
+  padding:20px 22px 16px;
+}
+.ly-disc{width:132px;height:132px;}
+.ly-hero .ht{
+  font-weight:900;font-size:30px;line-height:1.1;letter-spacing:-.01em;
+}
+.ly-hero .ht .hl{background:var(--pink);color:var(--ink);padding:0 6px 2px;}
+.ly-hero .ha{
+  margin-top:10px;font-weight:700;font-size:14px;letter-spacing:.1em;opacity:.8;
+}
+.ly-hero .ha b{color:var(--pink);opacity:1;}
+/* 进度 */
+.ly-progress{padding:6px 22px 4px;}
+.ly-progress .track{height:6px;background:var(--ink3);position:relative;}
+.ly-progress .track .fill{position:absolute;inset:0 auto 0 0;width:0%;background:var(--blue);}
+.ly-progress .tt{
+  display:flex;justify-content:space-between;margin-top:6px;
+  font-weight:700;font-size:12px;letter-spacing:.1em;color:var(--cream);opacity:.75;
+}
+/* 歌词滚动区: 几何律动, 当前行色块反白 */
+.ly-scroll{
+  flex:1;overflow-y:auto;
+  padding:18px 22px 18px;
+  -webkit-mask-image:linear-gradient(transparent,#000 12%,#000 88%,transparent);
+  mask-image:linear-gradient(transparent,#000 12%,#000 88%,transparent);
+}
+.ly-line{
+  font-weight:700;font-size:19px;line-height:1.45;
+  color:var(--cream);opacity:.38;
+  padding:9px 12px;
+  margin:4px 0;
+  border-left:6px solid transparent;
+  cursor:pointer;
+  transition:opacity .25s;
+}
+.ly-line.on{
+  opacity:1;
+  background:var(--pink);
+  color:var(--ink);
+  border-left:6px solid var(--ink);
+  font-weight:900;
+  transform:translateX(4px);
+}
+.ly-line.dots{letter-spacing:.3em;font-weight:900;}
+/* 底部大控制区 */
+.ly-ctrl{
+  border-top:4px solid var(--ink3);
+  background:var(--ink);
+  padding:14px 22px calc(16px + var(--safe-b));
+}
+.ly-ctrl .btns{
+  display:flex;align-items:center;justify-content:space-between;
+}
+.ly-ctrl .gbtn{width:56px;height:56px;}
+.ly-ctrl .gbtn.big{
+  width:76px;height:76px;min-width:76px;
+  background:var(--pink);border-color:var(--cream);
+}
+.ly-ctrl .gbtn.big .ic-play{border-width:14px 0 14px 22px;margin-left:5px;}
+.ly-ctrl .gbtn.big.ic-pause::before,.ly-ctrl .gbtn.big.ic-pause::after{width:8px;height:30px;top:23px;}
+.ly-ctrl .gbtn.big.ic-pause::before{left:22px;}
+.ly-ctrl .gbtn.big.ic-pause::after{right:22px;}
+.ly-ctrl .fav{border:none;background:transparent;}
+</style>
+</head>
+<body>
+
+<div class="bg-geo" aria-hidden="true">
+  <div class="g-circle"></div>
+  <div class="g-square"></div>
+  <div class="g-line"></div>
+  <div class="g-line l2"></div>
+  <div class="g-dots"></div>
+</div>
+
+<main>
+  <!-- 品牌区 -->
+  <header class="brand">
+    <div>
+      <span class="b-chip"><span class="chip-sq"></span>B站音乐</span>
+      <div class="b-note">NAS · PRIVATE PRESS</div>
+    </div>
+    <!-- 几何母题 · 旋转黑胶（品牌角标位） -->
+    <div class="disc brand-disc" aria-hidden="true">
+      <div class="d-ring1"></div>
+      <div class="d-spin">
+        <div class="d-ring2"></div>
+        <div class="d-ring3"></div>
+        <div class="d-label plain"></div>
+        <div class="d-hole"></div>
+        <div class="d-marker"></div>
+      </div>
+    </div>
+  </header>
+
+  <section class="hero">
+    <h1>随身<br><span class="hl">听</span></h1>
+    <div class="sub">
+      <span class="sq"></span>
+      <span>MY MUSIC VAULT</span>
+      <span class="rule"></span>
+    </div>
+  </section>
+
+  <!-- 搜索 -->
+  <section class="search">
+    <input class="field" type="search" placeholder="搜 B 站音频投稿…" value="晴天 周杰伦">
+    <button class="go" aria-label="搜索"><span class="ic-search"></span></button>
+  </section>
+
+  <!-- 结果条 -->
+  <div class="strip">
+    <span>搜索结果</span>
+    <span class="count">6 项</span>
+  </div>
+
+  <!-- 列表（JS 渲染真实数据） -->
+  <section class="list" id="list"></section>
+</main>
+
+<!-- 迷你播放条 -->
+<footer class="mini" id="mini" role="button" aria-label="展开歌词面板">
+  <span class="exp" aria-hidden="true"></span>
+  <div class="mini-in">
+    <div class="disc mini-disc" aria-hidden="true">
+      <div class="d-ring1"></div>
+      <div class="d-spin">
+        <div class="d-ring2"></div>
+        <div class="d-ring3"></div>
+        <div class="d-label" id="miniCover"><img alt=""></div>
+        <div class="d-hole"></div>
+        <div class="d-marker"></div>
+      </div>
+    </div>
+    <div class="mini-info">
+      <div class="mt" id="miniTitle">—</div>
+      <div class="ma" id="miniAuthor">—</div>
+      <div class="mini-prog"><span class="fill" id="miniFill"></span></div>
+    </div>
+    <div class="mini-ctrl">
+      <button class="gbtn" id="miniPrev" aria-label="上一首"><span class="ic-prev"><span class="tri"></span><span class="bar"></span></span></button>
+      <button class="gbtn pink" id="miniPlay" aria-label="播放/暂停"><span class="ic-play" id="miniPlayIc"></span></button>
+      <button class="gbtn" id="miniNext" aria-label="下一首"><span class="ic-next"><span class="tri"></span><span class="bar"></span></span></button>
+    </div>
+  </div>
+</footer>
+
+<!-- 歌词全屏面板 -->
+<div class="lyrics" id="lyrics" aria-hidden="true">
+  <div class="ly-top">
+    <button class="close" id="lyClose" aria-label="收起"></button>
+    <span class="ly-tag">LYRICS · 歌词</span>
+  </div>
+
+  <div class="ly-hero">
+    <!-- 母题放大版: 大唱片 + 真实封面作标签 -->
+    <div class="disc ly-disc" aria-hidden="true">
+      <div class="d-ring1"></div>
+      <div class="d-spin">
+        <div class="d-ring2"></div>
+        <div class="d-ring3"></div>
+        <div class="d-label" id="lyCover"><img alt=""></div>
+        <div class="d-hole"></div>
+        <div class="d-marker"></div>
+      </div>
+    </div>
+    <div>
+      <div class="ht"><span class="hl" id="lyTitle">晴天</span></div>
+      <div class="ha">UP 主 · <b id="lyAuthor">—</b></div>
+      <div class="ha" style="margin-top:4px;font-size:12px;letter-spacing:.18em;" id="lyPlayCount">—</div>
+    </div>
+  </div>
+
+  <div class="ly-progress">
+    <div class="track"><span class="fill" id="lyFill"></span></div>
+    <div class="tt"><span id="tCur">0:00</span><span id="tDur">4:30</span></div>
+  </div>
+
+  <div class="ly-scroll" id="lyScroll"></div>
+
+  <div class="ly-ctrl">
+    <div class="btns">
+      <button class="gbtn" id="lyPrev" aria-label="上一首"><span class="ic-prev"><span class="tri"></span><span class="bar"></span></span></button>
+      <button class="gbtn big" id="lyPlay" aria-label="播放/暂停"><span class="ic-play" id="lyPlayIc"></span></button>
+      <button class="gbtn" id="lyNext" aria-label="下一首"><span class="ic-next"><span class="tri"></span><span class="bar"></span></span></button>
+      <button class="gbtn fav" aria-label="收藏"><span class="ic-heart"></span></button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============ 真实歌单数据 (mockdata.json) ============ */
+const TRACKS=[
+ {title:"【𝐇𝐢-𝐑𝐞𝐬无损音质】｜《晴天》- 周杰伦 -'故事的小黄花'",author:"VV音乐局",pic:"https://i0.hdslb.com/bfs/archive/b72e06e408b1636bb9ca8df55a171e44d6ba1702.jpg",duration:270,play:3069040},
+ {title:"【4K修复】周杰伦 - 晴天MV 2160P修复版",author:"zyl2012_音乐无限",pic:"https://i1.hdslb.com/bfs/archive/6770f3a7d60f21469194251726588cee3b8bdb45.jpg",duration:317,play:17549049},
+ {title:"【周杰伦•晴天•超长尾奏•原始版】2022年8月29日，B站独家上线《周杰伦限定珍藏Demo访谈VCR》",author:"斩月白霞Bleach",pic:"https://i0.hdslb.com/bfs/archive/a9f390d5a7fa73bc8412a5aa4c9f0db2340a9ad2.jpg",duration:72,play:131},
+ {title:"周杰伦——《晴天》",author:"寻意zzzz",pic:"https://i1.hdslb.com/bfs/archive/6190f20921a6f9c09f7992f183285961dd421bcc.jpg",duration:267,play:495047},
+ {title:"【4K Hi-Res】晴天-周杰伦",author:"如歌如梦",pic:"https://i1.hdslb.com/bfs/archive/7cd9aeaeaa0bf2341551463ca90e8e47cbff0a62.jpg",duration:270,play:1046629},
+ {title:"【𝐇𝐢-𝐑𝐞𝐬·无损音质】《晴天》-周杰伦-\u201c故事的小黄花，从出生那年就飘着\u201d",author:"维登音乐",pic:"https://i2.hdslb.com/bfs/archive/9bba542099bea7212a4c56bec7aab72698ed9179.jpg",duration:270,play:15751}
+];
+
+/* 歌词: 原创示意文案（避免直接复制受版权歌词） */
+const LYRICS=[
+ {t:"· 前 奏 ·",dots:true},
+ {t:"风把窗吹开一条缝"},
+ {t:"雨停之前 别急着说话"},
+ {t:"你在放学路上 数着云"},
+ {t:"我把没说完的话 折进纸飞机"},
+ {t:"纸飞机 飞过旧操场"},
+ {t:"起风的下午 时间走得很慢"},
+ {t:"黑板上的日期 擦了又写"},
+ {t:"后来的我们 各自转弯"},
+ {t:"如果重来 还是这个夏天"},
+ {t:"· 尾奏 ·",dots:true}
+];
+
+const CUR=0; /* 正在播放: 第 1 条《晴天》 */
+const $=s=>document.querySelector(s);
+const fmt=s=>Math.floor(s/60)+":"+String(Math.floor(s%60)).padStart(2,"0");
+const fmtPlay=n=>n>=10000?(n/10000).toFixed(1).replace(/\.0$/,"")+"万":String(n);
+
+/* ============ 渲染列表 ============ */
+const list=$("#list");
+TRACKS.forEach((d,i)=>{
+  const row=document.createElement("article");
+  row.className="row"+(i===CUR?" playing":"");
+  row.innerHTML=i===CUR
+    ?`<div class="nowtag"><span class="rule"></span>NOW PLAYING · 正在播<span class="eq"><i></i><i></i><i></i></span></div>
+      <div class="cov"><img src="${d.pic}" alt="" referrerpolicy="no-referrer"></div>
+      <div><div class="t">${d.title}</div><div class="a">${d.author}</div></div>
+      <div class="meta"><span class="chip dur"><span class="tri"></span>${fmt(d.duration)}</span><span class="chip">${fmtPlay(d.play)} 播放</span></div>`
+    :`<div class="cov"><img src="${d.pic}" alt="" referrerpolicy="no-referrer"></div>
+      <div><div class="t">${d.title}</div><div class="a">${d.author}</div></div>
+      <div class="meta"><span class="chip dur"><span class="tri"></span>${fmt(d.duration)}</span><span class="chip">${fmtPlay(d.play)} 播放</span></div>`;
+  list.appendChild(row);
+});
+
+/* ============ 迷你条 / 歌词面板数据 ============ */
+const cur=TRACKS[CUR];
+$("#miniCover").innerHTML=`<img src="${cur.pic}" alt="" referrerpolicy="no-referrer">`;
+$("#miniTitle").textContent=cur.title;
+$("#miniAuthor").textContent=cur.author;
+$("#lyCover").innerHTML=`<img src="${cur.pic}" alt="" referrerpolicy="no-referrer">`;
+$("#lyTitle").textContent="晴天";
+$("#lyAuthor").textContent=cur.author;
+$("#lyPlayCount").textContent=fmtPlay(cur.play)+" · 次播放";
+$("#tDur").textContent=fmt(cur.duration);
+
+/* 当前行初始: 第 5 行 */
+const CUR_LINE=4;
+
+/* ============ 渲染歌词 ============ */
+const lyScroll=$("#lyScroll");
+LYRICS.forEach((l,i)=>{
+  const p=document.createElement("p");
+  p.className="ly-line"+(l.dots?" dots":"")+(i===CUR_LINE?" on":"");
+  p.textContent=l.t;
+  p.dataset.i=i;
+  lyScroll.appendChild(p);
+});
+
+/* ============ 状态与交互（最简 JS） ============ */
+let playing=true, progress=96; /* 起始 1:36，落在当前歌词行 */
+const DUR=cur.duration;
+
+function renderProgress(){
+  const pct=(progress/DUR*100).toFixed(2)+"%";
+  $("#miniFill").style.width=pct;
+  $("#lyFill").style.width=pct;
+  $("#tCur").textContent=fmt(progress);
+  const idx=Math.min(LYRICS.length-1,Math.floor(progress/DUR*LYRICS.length));
+  lyScroll.querySelectorAll(".ly-line").forEach((el,i)=>{
+    el.classList.toggle("on",i===idx);
+    if(i===idx&&$("#lyrics").classList.contains("open"))
+      el.scrollIntoView({block:"center",behavior:"smooth"});
+  });
+}
+function setPlaying(v){
+  playing=v;
+  document.body.classList.toggle("paused",!v);
+  ["#miniPlayIc","#lyPlayIc"].forEach(s=>{
+    const el=$(s);
+    el.classList.toggle("ic-pause",v);   /* 播放中 → 显示暂停 */
+    el.classList.toggle("ic-play",!v);   /* 已暂停 → 显示播放 */
+  });
+}
+let timer=setInterval(()=>{
+  if(!playing)return;
+  progress=(progress+0.5)%DUR;
+  renderProgress();
+},500);
+
+/* 展开/收起歌词面板 */
+function openLyrics(v){
+  $("#lyrics").classList.toggle("open",v);
+  $("#lyrics").setAttribute("aria-hidden",String(!v));
+  if(v)renderProgress();
+}
+$("#mini").addEventListener("click",e=>{if(!e.target.closest("button"))openLyrics(true);});
+$("#lyClose").addEventListener("click",()=>openLyrics(false));
+
+/* 播放控制 */
+$("#miniPlay").addEventListener("click",e=>{e.stopPropagation();setPlaying(!playing);});
+$("#lyPlay").addEventListener("click",()=>setPlaying(!playing));
+const next=()=>{progress=0;renderProgress();};
+$("#miniNext").addEventListener("click",e=>{e.stopPropagation();next();});
+$("#lyNext").addEventListener("click",next);
+$("#miniPrev").addEventListener("click",e=>{e.stopPropagation();progress=Math.max(0,progress-15);renderProgress();});
+$("#lyPrev").addEventListener("click",()=>{progress=Math.max(0,progress-15);renderProgress();});
+
+/* 点击歌词行跳转进度 */
+lyScroll.addEventListener("click",e=>{
+  const line=e.target.closest(".ly-line");
+  if(!line)return;
+  progress=(+line.dataset.i+0.5)/LYRICS.length*DUR;
+  renderProgress();
+});
+
+/* 支持 #lyrics 直达（供截图歌词态） */
+if(location.hash==="#lyrics")openLyrics(true);
+setPlaying(true);
+renderProgress();
+</script>
+</body>
+</html>

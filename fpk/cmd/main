@@ -1,0 +1,67 @@
+#!/bin/bash
+# bilimusic 生命周期脚本：start / stop / status
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+APP_DIR="${TRIM_APPDEST}/server"
+SOCKET_PATH="${TRIM_APPDEST}/app.sock"
+BASE_PATH="/app/bilimusic"
+
+# 数据目录优先用 data-share 声明的共享目录（卸载时保留收藏夹），
+# 拿不到就退回 PKGVAR，保证应用一定能起来。
+DATA_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+if [ -z "$DATA_DIR" ]; then DATA_DIR="${TRIM_PKGVAR}/data"; fi
+
+# Node 运行时由 install_dep_apps=nodejs_v22 提供
+export PATH=/var/apps/nodejs_v22/target/bin:$PATH
+
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
+
+check_process() { kill -0 "$1" 2>/dev/null; }
+
+status_app() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+    if [ -n "$pid" ] && check_process "$pid"; then return 0; fi
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+
+start_app() {
+  if status_app; then log_msg "already running"; return 0; fi
+  mkdir -p "${TRIM_PKGVAR}" "$DATA_DIR" 2>/dev/null
+  if ! command -v node >/dev/null 2>&1; then
+    echo "未找到 node，请确认 nodejs_v22 运行时已安装" > "$TRIM_TEMP_LOGFILE"
+    log_msg "node not found"
+    exit 1
+  fi
+  log_msg "starting (data=$DATA_DIR socket=$SOCKET_PATH)"
+  cd "$APP_DIR" || exit 1
+  DATA_DIR="$DATA_DIR" BASE_PATH="$BASE_PATH" SOCKET_PATH="$SOCKET_PATH" \
+    node server.js >> "$LOG_FILE" 2>&1 &
+  echo "$!" > "$PID_FILE"
+}
+
+stop_app() {
+  log_msg "stopping"
+  if [ ! -f "$PID_FILE" ]; then rm -f "$SOCKET_PATH" 2>/dev/null; return 0; fi
+  local pid
+  pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+  if [ -z "$pid" ] || ! check_process "$pid"; then
+    rm -f "$PID_FILE"; rm -f "$SOCKET_PATH" 2>/dev/null; return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  local count=0
+  while check_process "$pid" && [ "$count" -lt 10 ]; do sleep 1; count=$((count + 1)); done
+  if check_process "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+  rm -f "$PID_FILE"
+  rm -f "$SOCKET_PATH" 2>/dev/null
+}
+
+case "$1" in
+  start)  start_app ;;
+  stop)   stop_app ;;
+  status) if status_app; then exit 0; fi; exit 3 ;;
+  *) echo "Unknown command: $1" > "$TRIM_TEMP_LOGFILE"; exit 1 ;;
+esac

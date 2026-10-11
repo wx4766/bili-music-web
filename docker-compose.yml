@@ -1,0 +1,14 @@
+services:
+  bili-music-web:
+    build: .
+    container_name: bili-music-web
+    restart: always
+    ports:
+      - "8360:3000"
+    volumes:
+      - ./data:/data
+    environment:
+      - PORT=3000
+      - DATA_DIR=/data
+    # 需要访问外网（B 站 + 歌词接口）
+    network_mode: "bridge"

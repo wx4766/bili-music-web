@@ -1,0 +1,4 @@
+#!/bin/bash
+# 卸载后：只清理应用自己的 socket，data-share 由系统保留。
+rm -f "${TRIM_APPDEST}/app.sock" 2>/dev/null
+exit 0

@@ -1,0 +1,4 @@
+#!/bin/bash
+# 安装后：Windows 打包可能丢失执行位，这里补回来。
+chmod +x "${TRIM_APPDEST}/cmd/"* 2>/dev/null
+exit 0

@@ -1,0 +1,7 @@
+#!/bin/bash
+# 升级后：补执行位；升级前在跑的就重新拉起。
+chmod +x "${TRIM_APPDEST}/cmd/"* 2>/dev/null
+if [ "${TRIM_APP_STATUS}" = "running" ]; then
+  "${TRIM_APPDEST}/cmd/main" start || true
+fi
+exit 0

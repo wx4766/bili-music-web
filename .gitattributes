@@ -1,0 +1,9 @@
+# 统一按 LF 入库与检出：fpk 打包脚本要拿到 NAS 上执行，CRLF 会直接跑不起来
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.PNG binary
+*.jpg binary
+*.jpeg binary
+*.ico binary

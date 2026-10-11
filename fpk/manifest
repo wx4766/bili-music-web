@@ -1,0 +1,16 @@
+appname=bilimusic
+version=1.0.9
+display_name=B站音乐
+desc=自托管 B 站音乐播放器：搜索、热门、收藏夹、歌词、断点续播，手机浏览器与 PWA 随身听。
+source=thirdparty
+platform=all
+maintainer=laowang
+maintainer_url=https://www.bilibili.com
+distributor=laowang
+os_min_version=1.1.3100
+desktop_uidir=ui
+desktop_applaunchname=bilimusic.main
+install_dep_apps=nodejs_v22
+ctl_stop=true
+checkport=false
+changelog=首个版本：搜索 / 热门榜单 / 多收藏夹 / 歌词多源 / 断点续播 / 服务端音频缓存。

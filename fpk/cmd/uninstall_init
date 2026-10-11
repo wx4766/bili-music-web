@@ -1,0 +1,4 @@
+#!/bin/bash
+# 卸载前：停服务，不删用户数据。
+if [ -f "${TRIM_APPDEST}/cmd/main" ]; then "${TRIM_APPDEST}/cmd/main" stop || true; fi
+exit 0

@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+  <!-- B 站图床防盗链：不带 Referer 才放行，必须声明 no-referrer -->
+  <meta name="referrer" content="no-referrer" />
+  <meta name="theme-color" content="#101113" />
+  <!-- PWA / iOS 添加到主屏幕 -->
+  <!-- 统一网关前缀由服务端注入（%BASE%），根路径部署时为空串。
+       资源一律用相对路径：飞牛远程访问（FN Connect）会把路径改写成
+       /<fnid>/app/bilimusic/，写死绝对路径会丢掉 /<fnid> 这层前缀。 -->
+  <script>window.__BASE__ = "%BASE%";</script>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="apple-touch-icon.png" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="B站音乐" />
+  <title>B站音乐 · 随身听</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <!-- 统一网关前缀由服务端注入（%BASE%），根路径部署时为空串 -->
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <div class="brandrow">
+      <h1>随身听</h1>
+      <nav class="tabs">
+        <button class="tab active" data-tab="search">搜索</button>
+        <span class="tab-sep">/</span>
+        <button class="tab" data-tab="fav">收藏</button>
+        <span class="tab-sep">/</span>
+        <button class="tab" data-tab="recent">最近</button>
+      </nav>
+    </div>
+
+    <div class="search">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5">
+        <circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/>
+      </svg>
+      <input id="kw" type="search" placeholder="搜歌名 / 歌手 / 关键词" autocomplete="off" />
+      <button id="bvToggle" class="key ic" aria-label="用 BV 号播放" aria-expanded="false" title="粘贴 BV 号播放">BV</button>
+      <button id="searchBtn" class="key">搜索</button>
+    </div>
+    <!-- BV 直通：非常用功能，默认收起，点 BV 才展开 -->
+    <div id="bvRow" class="search bv hidden">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5">
+        <rect x="2" y="4" width="12" height="9" rx="1"/><path d="M6 7v3M10 7v3"/>
+      </svg>
+      <input id="bv" type="text" placeholder="粘贴 BV 号直接播放" autocomplete="off" autocapitalize="off" />
+      <button id="bvBtn" class="key">播放</button>
+    </div>
+    <div class="sortbar" id="sortbar" role="group" aria-label="搜索排序">
+      <span class="sortlabel">排序</span>
+      <button class="sort on" data-order="totalrank">默认</button>
+      <button class="sort" data-order="click">播放次数</button>
+      <button class="sort" data-order="pubdate">上传时间</button>
+      <span class="sortpad"></span>
+    </div>
+    <!-- 榜单范围：仅在热门榜模式显示 -->
+    <div class="sortbar rangebar hidden" id="rangebar" role="group" aria-label="榜单范围">
+      <span class="sortlabel">榜单</span>
+      <button class="sort rchip on" data-range="week">本周</button>
+      <button class="sort rchip" data-range="month">本月</button>
+      <button class="sort rchip" data-range="total">累计</button>
+    </div>
+  </header>
+
+  <!-- 搜索视图 -->
+  <main id="view-search" class="view active">
+    <!-- 断点续播：上次没听完的那首，进来就能接上 -->
+    <section id="resumeCard" class="resume hidden">
+      <div class="r-thumb"><img id="rsCover" src="" alt="" /></div>
+      <div class="r-main">
+        <div class="r-tag">继续上次</div>
+        <div id="rsTitle" class="r-title">—</div>
+        <div class="r-bar"><span id="rsFill"></span></div>
+        <div id="rsPos" class="r-pos">—</div>
+      </div>
+      <button id="rsPlay" class="r-btn">接着听</button>
+    </section>
+    <!-- 合辑展开后的快捷操作条 -->
+    <div id="albumBar" class="albumbar hidden">
+      <span id="albumInfo" class="al-info">已展开</span>
+      <span class="spacer"></span>
+      <button id="albumCollect" class="al-btn">全部收藏</button>
+      <button id="albumDismiss" class="al-btn ghost">收起</button>
+    </div>
+    <div class="seclabel">
+      <span id="resLabel">音乐区排行</span>
+      <button id="resSwitch" class="tlink hidden">刷新</button>
+    </div>
+    <div id="results" class="tracks"></div>
+    <!-- 搜索分页：触底自动加载，也有手动按钮兜底 -->
+    <div id="moreWrap" class="morebar hidden">
+      <button id="loadMore" class="morebtn">加载更多</button>
+      <div id="noMore" class="hint hidden">没有更多了</div>
+    </div>
+    <div id="searchHint" class="hint hidden">正在加载热门…</div>
+  </main>
+
+  <!-- 收藏视图（多播放列表） -->
+  <main id="view-fav" class="view">
+    <div class="plbar">
+      <div id="plChips" class="pl-chips"></div>
+      <button id="plNew" class="pl-new" aria-label="新建列表">＋</button>
+    </div>
+    <div class="pltools">
+      <button id="plRename" class="tlink">重命名</button>
+      <span class="dot">·</span>
+      <button id="plDelete" class="tlink">删除列表</button>
+      <span class="dot">·</span>
+      <button id="plSort" class="tlink">排序</button>
+      <span class="spacer"></span>
+      <button id="plPlayAll" class="tlink play">播放全部</button>
+    </div>
+    <div class="seclabel"><span id="favLabel">我的收藏</span></div>
+    <div id="favList" class="tracks"></div>
+    <div id="favHint" class="hint">这个列表还是空的。播放时点 ♥ 可以把歌收进来。</div>
+  </main>
+
+  <!-- 最近播放（跨设备共享，服务端持久化） -->
+  <main id="view-recent" class="view">
+    <div class="pltools">
+      <span id="recLabel" class="tlink">最近播放</span>
+      <span class="spacer"></span>
+      <button id="recClear" class="tlink">清空</button>
+    </div>
+    <div id="recentList" class="tracks"></div>
+    <div id="recentHint" class="hint">还没有听过歌</div>
+  </main>
+
+  <!-- 底部迷你播放条 -->
+  <footer id="player" class="mini hidden">
+    <input id="seek" class="seek" type="range" min="0" max="100" value="0" step="0.1" />
+    <div class="minirow">
+      <div class="thumb" id="mThumb"><img id="pCover" src="" alt="" /></div>
+      <div class="info">
+        <div id="pTitle" class="t">未在播放</div>
+        <div id="pAuthor" class="a"></div>
+        <div class="time"><span id="curTime">0:00</span> / <span id="durTime">0:00</span><span id="sleepTag" class="sleeptag hidden"></span></div>
+      </div>
+      <div class="ctrls">
+        <button id="pFav" class="cbtn heart" aria-label="收藏">
+          <svg width="18" height="18" viewBox="0 0 22 22" fill="none" stroke-width="1.6">
+            <path d="M11 18.5S3.5 14 3.5 8.6C3.5 6 5.6 4 8 4c1.3 0 2.4.6 3 1.6C11.6 4.6 12.7 4 14 4c2.4 0 4.5 2 4.5 4.6C18.5 14 11 18.5 11 18.5z"/>
+          </svg>
+        </button>
+        <button id="prevBtn" class="cbtn" aria-label="上一首">
+          <svg width="17" height="17" viewBox="0 0 18 18" fill="none" stroke-width="1.6">
+            <path d="M13 3v12L5.5 9z" fill="currentColor" stroke="none"/><path d="M4.5 3.5v11"/>
+          </svg>
+        </button>
+        <button id="playBtn" class="cbtn play" aria-label="播放/暂停">
+          <svg id="playIcon" width="17" height="17" viewBox="0 0 18 18" fill="none" stroke-width="1.8"></svg>
+        </button>
+        <button id="nextBtn" class="cbtn" aria-label="下一首">
+          <svg width="17" height="17" viewBox="0 0 18 18" fill="none" stroke-width="1.6">
+            <path d="M5 3v12l7.5-6z" fill="currentColor" stroke="none"/><path d="M13.5 3.5v11"/>
+          </svg>
+        </button>
+        <button id="lyricsBtn" class="cbtn" aria-label="歌词">
+          <svg width="17" height="17" viewBox="0 0 20 20" fill="none" stroke-width="1.6">
+            <path d="M4 5h12M4 9h12M4 13h7"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <audio id="audio" preload="auto" playsinline webkit-playsinline x5-playsinline></audio>
+    <!-- 备用音频元素：用来预载下一首（双元素交替，切歌零等待）。
+         不能用 display:none —— iOS 对隐藏的媒体元素可能停止加载，
+         所以用「1px + 全透明 + 不可点击」的方式藏起来。 -->
+    <audio id="audio2" preload="auto" playsinline webkit-playsinline x5-playsinline
+      style="position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none"></audio>
+  </footer>
+
+  <!-- 歌词面板（全屏显示模式） -->
+  <section id="lyricsPanel" class="lyrics hidden" aria-label="歌词面板">
+    <div class="ly-head">
+      <span class="tag">正在播放</span>
+      <button id="lyricsClose" class="close" aria-label="收起">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="#a7acb4" stroke-width="1.6">
+          <path d="M4 11l5-5 5 5"/>
+        </svg>
+      </button>
+    </div>
+    <div id="lyBody" class="ly-body">
+      <div class="ly-cover">
+        <img id="lyPic" src="" alt="" />
+        <div class="frame"></div>
+      </div>
+      <div id="lyTitle" class="ly-title">—</div>
+      <div id="lyAuthor" class="ly-sub">—</div>
+      <div id="lyricsBody" class="ly-lines"></div>
+    </div>
+    <!-- 播放设置：模式 / 睡眠定时 / 歌词偏移。集中在这里，不占迷你条的宽度 -->
+    <div class="ly-tools">
+      <div class="toolrow">
+        <span class="tool-label">播放模式</span>
+        <div class="modes" id="modeBtns">
+          <button class="mchip" data-mode="seq">顺序</button>
+          <button class="mchip" data-mode="loop">列表循环</button>
+          <button class="mchip" data-mode="single">单曲循环</button>
+          <button class="mchip" data-mode="shuffle">随机</button>
+        </div>
+      </div>
+      <div class="toolrow">
+        <span class="tool-label">睡眠定时</span>
+        <div class="modes" id="sleepBtns">
+          <button class="mchip" data-min="0">关</button>
+          <button class="mchip" data-min="15">15 分</button>
+          <button class="mchip" data-min="30">30 分</button>
+          <button class="mchip" data-min="60">60 分</button>
+        </div>
+      </div>
+      <div class="toolrow">
+        <span class="tool-label">歌词偏移</span>
+        <div class="modes">
+          <button class="mchip" id="lyMinus">−0.5s</button>
+          <span id="lyOffset" class="offval">0.0s</span>
+          <button class="mchip" id="lyPlus">+0.5s</button>
+          <button class="mchip" id="lyReset">重置</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- 收藏到…（选列表弹层） -->
+  <div id="plSheetMask" class="sheet-mask hidden"></div>
+  <section id="plSheet" class="sheet hidden" aria-label="收藏到列表">
+    <div class="sheet-head">
+      <span class="tag">收藏到…</span>
+      <button id="plSheetClose" class="close" aria-label="关闭">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="#a7acb4" stroke-width="1.6">
+          <path d="M4 11l5-5 5 5"/>
+        </svg>
+      </button>
+    </div>
+    <div id="plSheetTitle" class="sheet-title">—</div>
+    <div id="plSheetList" class="sheet-list"></div>
+    <div class="sheet-hint">✓ = 已收藏，再点一次取消；可一次勾选多个列表</div>
+    <div class="sheet-new">
+      <input id="plNewName" type="text" placeholder="新建列表，起个名字" autocomplete="off" />
+      <button id="plNewBtn" class="key">新建</button>
+    </div>
+  </section>
+
+  <!-- 确认操作（防误删） -->
+  <div id="cfMask" class="sheet-mask hidden"></div>
+  <section id="cfSheet" class="sheet confirm hidden" aria-label="确认操作">
+    <div class="sheet-head"><span class="tag">确认操作</span></div>
+    <div id="cfTitle" class="cf-title">—</div>
+    <div id="cfMsg" class="cf-msg"></div>
+    <div class="cf-actions">
+      <button id="cfNo" class="cf-btn">取消</button>
+      <button id="cfOk" class="cf-btn danger">删除</button>
+    </div>
+  </section>
+
+  <!-- 文本输入弹层（重命名 / 新建列表）：iOS 原生 prompt 样式和系统不符，统一换成自家弹层 -->
+  <div id="inMask" class="sheet-mask hidden"></div>
+  <section id="inSheet" class="sheet confirm hidden" aria-label="输入内容">
+    <div class="sheet-head"><span class="tag">输入</span></div>
+    <div id="inTitle" class="cf-title">—</div>
+    <div class="sheet-new">
+      <input id="inValue" type="text" placeholder="" autocomplete="off" />
+    </div>
+    <div class="cf-actions">
+      <button id="inNo" class="cf-btn">取消</button>
+      <button id="inOk" class="cf-btn danger">确定</button>
+    </div>
+  </section>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

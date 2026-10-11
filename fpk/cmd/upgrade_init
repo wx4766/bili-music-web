@@ -1,0 +1,4 @@
+#!/bin/bash
+# 升级前：先停掉旧进程，避免 socket 残留。
+if [ -f "${TRIM_APPDEST}/cmd/main" ]; then "${TRIM_APPDEST}/cmd/main" stop || true; fi
+exit 0

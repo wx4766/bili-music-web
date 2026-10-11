@@ -1,0 +1,5 @@
+#!/bin/bash
+# 配置变更后重启服务。
+if [ -f "${TRIM_APPDEST}/cmd/main" ]; then "${TRIM_APPDEST}/cmd/main" stop || true; fi
+"${TRIM_APPDEST}/cmd/main" start || true
+exit 0
