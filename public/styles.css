@@ -44,10 +44,20 @@ img{display:block}
 header{padding:calc(18px + env(safe-area-inset-top,0px)) 16px 0}
 .brandrow{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px}
 .brandrow h1{font-size:28px;font-weight:700;letter-spacing:.02em;line-height:1.2}
-.tabs{display:flex;align-items:baseline;gap:8px;font-family:var(--mono);font-size:12px;letter-spacing:.1em}
-.tab{color:var(--dim);padding:4px 2px;letter-spacing:.14em}
+.tabs{display:flex;align-items:baseline;gap:14px;font-family:var(--mono);font-size:12px;letter-spacing:.1em}
+.tab{color:var(--dim);padding:4px 2px;letter-spacing:.14em;position:relative}
 .tab.active{color:var(--ink);border-bottom:2px solid var(--pink)}
 .tab-sep{color:var(--line)}
+
+/* ---------- 热区合规（评审 P1-6）----------
+   这几个控件字号小、视觉上就要这么紧凑（硬件面板风格），但 20px 高的热区
+   单手/车上一瞥根本点不中。做法：**视觉尺寸不动**，用伪元素把可点区域撑到 44px。
+   左右各扩 6px、上下补到 44px，同时把 gap 拉开到 14px 避免扩展后的热区互相压住。 */
+.tab::after,.sort::after,.search .key::after,#resSwitch::after{
+  content:"";position:absolute;left:-6px;right:-6px;top:50%;
+  height:44px;transform:translateY(-50%);
+}
+.sort,#resSwitch{position:relative}
 
 /* ---------- search ---------- */
 .search{
@@ -66,7 +76,7 @@ header{padding:calc(18px + env(safe-area-inset-top,0px)) 16px 0}
 .search input::placeholder{color:var(--dim)}
 .search input::-webkit-search-cancel-button{display:none}
 .search .key{
-  flex:none;font-family:var(--mono);font-size:12px;color:var(--sub);
+  position:relative;flex:none;font-family:var(--mono);font-size:12px;color:var(--sub);
   border:1px solid var(--line);padding:5px 10px;letter-spacing:.1em;
   background:var(--panel-2);
 }
@@ -80,7 +90,7 @@ header{padding:calc(18px + env(safe-area-inset-top,0px)) 16px 0}
 
 /* ---------- 搜索排序 ---------- */
 .sortbar{
-  display:flex;align-items:center;gap:7px;
+  display:flex;align-items:center;gap:12px;
   padding:2px 0 0;
   overflow-x:auto;scrollbar-width:none;
 }
@@ -115,7 +125,7 @@ header{padding:calc(18px + env(safe-area-inset-top,0px)) 16px 0}
 .seclabel::after{content:"";flex:1;height:1px;background:var(--line-soft)}
 #resSwitch{
   flex:none;font-family:var(--mono);font-size:11px;letter-spacing:.08em;
-  color:var(--dim);padding:1px 0;
+  color:var(--dim);padding:1px 0;min-width:44px;text-align:right;
 }
 #resSwitch:active{color:var(--pink)}
 
@@ -268,7 +278,7 @@ header{padding:calc(18px + env(safe-area-inset-top,0px)) 16px 0}
 .sheet-head .tag{
   font-family:var(--mono);font-size:11px;letter-spacing:.2em;color:var(--dim);
 }
-.sheet .close{width:36px;height:36px;margin-right:-8px;display:flex;align-items:center;justify-content:center}
+.sheet .close{width:44px;height:44px;margin-right:-8px;display:flex;align-items:center;justify-content:center}
 .sheet-title{
   font-size:13px;color:var(--sub);line-height:1.4;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
@@ -379,7 +389,7 @@ header{padding:calc(18px + env(safe-area-inset-top,0px)) 16px 0}
 }
 .ctrls{display:flex;align-items:center;gap:0;flex:none}
 .cbtn{
-  width:42px;height:42px;
+  width:44px;height:44px;
   display:flex;align-items:center;justify-content:center;
   color:var(--ink);
 }
@@ -392,7 +402,7 @@ header{padding:calc(18px + env(safe-area-inset-top,0px)) 16px 0}
 /* seek 轨道（输入框拟物成细轨+方旋钮） */
 .seek{
   -webkit-appearance:none;appearance:none;
-  display:block;width:100%;height:18px;
+  display:block;width:100%;height:30px;   /* 轨道视觉仍是 2px，容器拉高只为让手指点得中 */
   margin:-4px 0 4px;background:none;cursor:pointer;
 }
 .seek::-webkit-slider-runnable-track{

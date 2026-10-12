@@ -112,8 +112,10 @@ python build_fpk.py          # 需要 fnpack + Pillow
 ACCESS_TOKEN=你的口令 node server.js
 ```
 
-之后首次用 `http://<地址>/?k=你的口令` 打开一次，浏览器会记住一年（写入 cookie），
-以后直接访问根路径就行。`/api/health` 始终放行，方便探活。
+设置后访问任意页面会看到一个口令输入框，填一次即可（浏览器记住一年）。
+旧式的 `http://<地址>/?k=你的口令` 链接仍然兼容，命中后同样会下发 cookie，
+之后 URL 里就不必再带着口令了。cookie 带 `HttpOnly`，走 HTTPS 时自动加 `Secure`。
+`/api/health` 始终放行，方便探活。
 
 ### 在公网访问
 
@@ -124,7 +126,31 @@ ACCESS_TOKEN=你的口令 node server.js
    支持 UPnP 的路由器可以让服务端自动申请映射，省掉手动配置。
 2. 用 DDNS 域名访问，例如 `http://nas.example.com:8360/`。
 3. **务必设置 `ACCESS_TOKEN`**。
-4. 想要 HTTPS / PWA 完整体验，在前面套一层反向代理（Caddy / nginx）签发证书。
+4. **强烈建议上 HTTPS**（见下）：不上 HTTPS，PWA 离线、锁屏封面、cookie `Secure`
+   全都拿不到，口令也是明文过公网。
+
+### 上 HTTPS（Caddy 反代）
+
+iOS Safari 只在安全上下文里注册 Service Worker —— 所以只要还是 HTTP，
+「添加到主屏幕」就只是个快捷方式，离线、锁屏封面都用不了。
+在前面挂一层 Caddy 做 TLS 终结即可，流量仍然直连，不过任何中转：
+
+```
+客户端 --HTTPS--> Caddy:8361 --HTTP--> node:8362
+```
+
+```bash
+# 1) 服务端改听本机端口（以 systemd 为例）
+Environment=PORT=8362
+
+# 2) Caddy 配置见 docs/Caddyfile.example（含自建 CA 的完整命令）
+# 3) 证书：有公网域名能做 DNS-01 就用 Let's Encrypt；
+#    否则自建 CA，把根证书装进手机并开启「完全信任」
+```
+
+自建 CA 时 iPhone 的安装路径：传输 `ca.crt` 到手机 → 安装描述文件 →
+「设置 → 通用 → 关于本机 → 证书信任设置」里打开完全信任。
+注意 iOS 13+ 要求服务器证书有效期 ≤ 398 天且必须带 SAN。
 
 ---
 
@@ -133,6 +159,7 @@ ACCESS_TOKEN=你的口令 node server.js
 - **不登录 B 站**：走游客取流，听不了大会员专属的高码率 / Hi-Res 音源。
 - **飞牛 App 内置浏览器不能出声**：飞牛手机 App 的 WebView 限制了音频播放，请用系统 Safari / Chrome 打开。
 - **HTTP 下 PWA 无法离线**：Service Worker 需要安全上下文（HTTPS 或 localhost）。
+  想用「添加到主屏幕 + 离线 + 锁屏封面」，必须按上一节上 HTTPS。
 - 音频缓存默认上限 200 个文件 / 1.5 GB，超出按 LRU 清理。
 
 ---

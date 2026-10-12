@@ -935,7 +935,10 @@ const RANGE_CHUNK = 192 * 1024;
 // 本地命中：直接 fs 流式返回 + 手算 Range。
 // Content-Range 算错一个字节，浏览器就会判定"响应不完整"并直接报错，
 // 所以这里严格按 RFC 7233 处理三种形态： a-b / a- / -b，越界回 416。
-function serveCachedAudio(req, res, cid, size) {
+// noChunk=true 时不截断（客户端专用，见下）：客户端自己分片并发下载时，
+// 192KB 的上限会让一次下载变成上百次往返；而媒体栈路径必须保持小分片，
+// 否则又会回到「整首一次性吐出 → 弱网重传风暴」的老问题上。
+function serveCachedAudio(req, res, cid, size, noChunk) {
   const file = audioCacheFile(cid);
   res.setHeader('content-type', 'audio/mp4');
   res.setHeader('accept-ranges', 'bytes');
@@ -964,7 +967,7 @@ function serveCachedAudio(req, res, cid, size) {
     if (end < start) end = start;
     // 分片上限：一次最多吐 RANGE_CHUNK 字节，剩下的让播放器自己继续要。
     // bytes=0-1 这类探测包本来就没超过上限，不受影响。
-    if (end - start + 1 > RANGE_CHUNK) {
+    if (!noChunk && end - start + 1 > RANGE_CHUNK) {
       end = start + RANGE_CHUNK - 1;
       res.setHeader('x-range-policy', 'chunk');
     }
@@ -1620,7 +1623,7 @@ async function handleApi(req, res, url) {
       } catch {}
       console.log(`[play] local cache ${cid} (${(size / 1048576).toFixed(1)}MB)`);
       try {
-        serveCachedAudio(req, res, cid, size);
+        serveCachedAudio(req, res, cid, size, q.get('full') === '1');
         return;
       } catch (e) {
         console.warn('[play] local cache read failed: ' + e.message);
@@ -1858,6 +1861,13 @@ function readBody(req) {
     let buf = '';
     req.on('data', (c) => (buf += c));
     req.on('end', () => {
+      const ct = String(req.headers['content-type'] || '');
+      // 口令登录走的是普通表单提交（application/x-www-form-urlencoded）
+      if (/application\/x-www-form-urlencoded/i.test(ct)) {
+        const o = {};
+        try { new URLSearchParams(buf).forEach((v, k) => { o[k] = v; }); } catch {}
+        return resolve(o);
+      }
       try {
         resolve(buf ? JSON.parse(buf) : {});
       } catch {
@@ -1945,6 +1955,47 @@ function redactUrl(u) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 访问口令（v1.1.0 改造）
+//   - 比较用 timingSafeEqual（先 sha256 成定长再比，避免长度本身泄露信息）
+//   - cookie 加 HttpOnly（JS 读不到）+ 走 HTTPS 时加 Secure
+//   - 不再只能靠 ?k= 传口令：401 页直接给一个表单，POST 到 /api/login
+//     —— 口令因此不会留在浏览历史、Referer 或分享出去的链接里
+// ---------------------------------------------------------------------------
+function tokenMatch(given, expected) {
+  if (!expected) return false;
+  const a = crypto.createHash('sha256').update(String(given || '')).digest();
+  const b = crypto.createHash('sha256').update(String(expected)).digest();
+  try { return crypto.timingSafeEqual(a, b); } catch { return false; }
+}
+
+// 反代终止 TLS 时，node 这边看到的是 http，只能靠 X-Forwarded-Proto 判断
+function requestIsHttps(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  return !!req.socket.encrypted || proto === 'https';
+}
+
+function cookieAttrs(req) {
+  const secure = requestIsHttps(req) ? '; Secure' : '';
+  return `bm_k=${encodeURIComponent(ACCESS_TOKEN)}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly${secure}`;
+}
+
+function denyPage(req, res) {
+  const action = `${BASE_PATH || ''}/api/login`;
+  res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end('<!doctype html><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>需要访问口令</title>'
+    + '<div style="font-family:system-ui,-apple-system;padding:2rem;line-height:1.8;color:#222;max-width:22rem;margin:0 auto">'
+    + '<h3 style="margin:0 0 .4rem">需要访问口令</h3>'
+    + '<p style="color:#666;margin:0 0 1rem;font-size:14px">输入口令即可进入，浏览器会记住一年。</p>'
+    + `<form method="post" action="${action}" style="display:flex;gap:8px">`
+    + '<input name="k" type="password" autocomplete="current-password" autofocus required '
+    + 'style="flex:1;min-width:0;padding:.7rem .8rem;border:1px solid #ccc;border-radius:8px;font-size:16px">'
+    + '<button type="submit" style="padding:.7rem 1.1rem;border:0;border-radius:8px;background:#222;color:#fff;font-size:16px">进入</button>'
+    + '</form></div>');
+}
+
 // 服务端访问日志（v1.0.3）：网关转发模式下排查「App 内能开页面但 API 全空」
 // 这类问题必须看到网关转发来的真实请求：路径形态 / UA / 有无凭据头。
 // 记录：时间 方法 原始路径 状态码 UA Referer 凭据线索。4MB 轮转，读数走 /api/log。
@@ -1988,18 +2039,30 @@ const server = http.createServer(async (req, res) => {
   const url = stripBase(parseUrl(req));
   res.on('finish', () => accessLog(req, res, req.url));
   try {
-    // 访问口令：health 放行（探活用），其余一律要口令或已下发的 cookie
-    if (ACCESS_TOKEN && url.pathname !== '/api/health') {
+    // 口令登录：表单 POST。口令不进 URL，也就不会留在浏览历史 / Referer / 日志里。
+    if (url.pathname === '/api/login' && req.method === 'POST') {
+      if (!rateAllow(clientIp(req), 'write')) {
+        res.setHeader('Retry-After', '10');
+        return sendJson(res, 429, { error: '试得太快了，歇 10 秒' });
+      }
+      const body = await readBody(req);
+      if (tokenMatch(body.k, ACCESS_TOKEN)) {
+        res.writeHead(303, { 'Set-Cookie': cookieAttrs(req), Location: `${BASE_PATH || ''}/` });
+        return res.end();
+      }
+      res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end('口令不对');
+    }
+
+    // 访问口令：health 与 login 放行（探活 / 登录用），其余一律要口令或已下发的 cookie
+    if (ACCESS_TOKEN && url.pathname !== '/api/health' && url.pathname !== '/api/login') {
       const ck = parseCookieHeader(req.headers.cookie);
       const qk = url.searchParams.get('k');
-      if (qk && qk === ACCESS_TOKEN) {
-        res.setHeader('Set-Cookie', 'bm_k=' + ACCESS_TOKEN + '; Path=/; Max-Age=31536000; SameSite=Lax');
-      } else if (ck.bm_k !== ACCESS_TOKEN) {
-        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<!doctype html><meta charset="utf-8">'
-          + '<meta name="viewport" content="width=device-width,initial-scale=1">'
-          + '<div style="font-family:system-ui;padding:2rem;line-height:1.8;color:#333">'
-          + '<h3>需要访问口令</h3><p>请用带口令的链接打开本站。</p></div>');
+      if (qk && tokenMatch(qk, ACCESS_TOKEN)) {
+        // 兼容旧书签里的 ?k= 链接：命中后同样下发 cookie，之后 URL 里的口令就不必再带着了
+        res.setHeader('Set-Cookie', cookieAttrs(req));
+      } else if (!tokenMatch(ck.bm_k, ACCESS_TOKEN)) {
+        denyPage(req, res);
         return;
       }
     }

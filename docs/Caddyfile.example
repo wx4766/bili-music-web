@@ -1,0 +1,48 @@
+# 在 B站音乐 前面挂一层 Caddy 做 TLS 终结（示例）
+#
+# 为什么值得做：HTTP 下 iOS Safari 根本不注册 Service Worker（PWA/离线全废）、
+# cookie 拿不到 Secure、口令明文过公网、锁屏封面也取不到图。
+# 这一层只做 TLS：流量仍走你自己的端口映射直连，不走任何中转，速度不受影响。
+#
+# 用法：把下面的域名和 IP 换成你自己的，证书用「自建 CA」或「正式证书」两种都行。
+{
+	# 必须关掉自动 HTTPS：它要监听 :80 做 HTTP-01 挑战，
+	# 而家用 NAS 的 80 端口通常被系统自己的 nginx 占着（一冲突 Caddy 就起不来）。
+	# 关掉它也意味着不能用 `tls internal`（内部 CA 的自动签发同属自动 HTTPS），
+	# 所以证书在下面用 tls 指令手动指定。
+	auto_https off
+	log {
+		output file /var/log/caddy/bilimusic.log
+	}
+}
+
+https://nas.example.com:8361 {
+	tls /etc/caddy/certs/bilimusic.crt /etc/caddy/certs/bilimusic.key
+	reverse_proxy 127.0.0.1:8362 {
+		flush_interval -1        # 音频流不要缓冲，否则起播会慢一截
+	}
+}
+
+# 家里直接走内网 IP 也给它一张证书（证书 SAN 里要带上这个 IP）
+https://192.168.1.50:8361 {
+	tls /etc/caddy/certs/bilimusic.crt /etc/caddy/certs/bilimusic.key
+	reverse_proxy 127.0.0.1:8362 {
+		flush_interval -1
+	}
+}
+
+# —— 自建 CA（iOS 要信任才不弹警告，且 PWA 才可能生效）——
+#   # 根 CA
+#   openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 3650 \
+#     -subj "/CN=BiliMusic Home CA" \
+#     -addext "basicConstraints=critical,CA:TRUE" \
+#     -addext "keyUsage=critical,keyCertSign,cRLSign"
+#   # 服务器证书：iOS 13+ 要求有效期 <= 398 天、必须带 SAN
+#   openssl req -newkey rsa:2048 -nodes -keyout bilimusic.key -out b.csr -subj "/CN=nas.example.com"
+#   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:nas.example.com,IP:192.168.1.50\n' > leaf.ext
+#   openssl x509 -req -in b.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+#     -out bilimusic.crt -days 398 -sha256 -extfile leaf.ext
+#
+# 然后把 ca.crt 装到 iPhone：传输过去 → 安装描述文件 →
+# 「设置 → 通用 → 关于本机 → 证书信任设置」里打开完全信任。
+# 有公网域名且能做 DNS-01 挑战的话，直接用 Let's Encrypt 正式证书更好，一步到位没有警告。

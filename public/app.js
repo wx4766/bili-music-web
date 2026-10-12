@@ -648,7 +648,7 @@ async function playIndex(idx, opts = {}) {
     // 上一首播放期间已经把这一首整段拉到内存了 → 直接建 blob，零网络零等待。
     // 这条路径是 iOS 后台连播的关键：切歌时不发任何 fetch、不碰媒体栈，
     // 只换一个内存 blob，页面即便被系统挂起也不会卡住。
-    const preHit = (IS_REMOTE && remotePreload && remotePreload.key === wantKey && remotePreload.bytes)
+    const preHit = (IS_REMOTE && remotePreload && remotePreload.key === wantKey && remotePreload.parts)
       ? remotePreload : null;
     if (!preHit) {
       // 先把整首拉到 NAS 本地缓存，再设 src —— 播放请求就走本地磁盘直读。
@@ -659,11 +659,13 @@ async function playIndex(idx, opts = {}) {
       await ensureWarm(item);
       clearTimeout(warmHint);
     }
-    const playUrl = apiUrl(`/api/play?bvid=${encodeURIComponent(item.bvid)}&cid=${item.cid}`);
+    // 远程走「客户端自己分片」：带 full=1 让服务端不再截到 192KB。
+    // 局域网/媒体栈路径不加 —— 那条路仍需要小分片来避免弱网重传风暴。
+    const playUrl = apiUrl(`/api/play?bvid=${encodeURIComponent(item.bvid)}&cid=${item.cid}${IS_REMOTE ? '&full=1' : ''}`);
     if (IS_REMOTE) {
       if (preHit) {
-        dlog('rp-hit', { cid: item.cid, bytes: preHit.bytes.length });
-        blobFromBytes(preHit.bytes);
+        dlog('rp-hit', { cid: item.cid, bytes: partsBytes(preHit.parts) });
+        blobFromBytes(preHit.parts);
         remotePreload = null;   // 已消费，释放这几 MB
         A().src = blobUrl;
       } else {
@@ -846,9 +848,13 @@ let prevBlobUrl = '';   // 上一首的 blob：等下一首建好才吊销
 function releaseBlob() {
   if (prevBlobUrl) { try { URL.revokeObjectURL(prevBlobUrl); } catch {} prevBlobUrl = ''; }
 }
-function makeBlobUrl(bytes, type) {
+// 传数组时零拷贝合并：直接把分片交给 Blob，不再先合成一个几十 MB 的 Uint8Array
+function makeBlobUrl(bytesOrParts, type) {
   prevBlobUrl = blobUrl;
-  blobUrl = URL.createObjectURL(new Blob([bytes], { type: type || 'audio/mp4' }));
+  const blob = Array.isArray(bytesOrParts)
+    ? new Blob(bytesOrParts, { type: type || 'audio/mp4' })
+    : new Blob([bytesOrParts], { type: type || 'audio/mp4' });
+  blobUrl = URL.createObjectURL(blob);
   return blobUrl;
 }
 
@@ -911,62 +917,100 @@ async function rescueViaBlob(item, url) {
 // 现在改为**按响应里的 content-range 实际推进**：服务端回多少就收多少，
 // 天然适配任何分片上限，也不再需要单独发一个 1 字节探测包。
 // fetchBytesChunked 只管拉字节（播放/预取共用）；fetchChunked 拉完直接接管播放。
-const CHUNK_STEP = 192 * 1024;   // 与服务端 RANGE_CHUNK 对齐，一次请求一次回满
-async function fetchBytesChunked(url, { onProgress, signal } = {}) {
+//
+// ⚠️ 2026-10-13 提速（评审 P0-4）：
+// 原来「串行 192KB 一片」= 35MB 音频要 180 次往返，弱网下光 RTT 就吃掉十几秒。
+// 现在改两件事：
+//   1) 服务端给客户端专用的 `full=1` 参数（不截断，媒体栈那条路径仍保持 192KB 不变，
+//      避免把「重传风暴」的老毛病引回来），客户端分片因此可以从 192KB 提到 2MB；
+//   2) 3 路并行。串行变 3 路后，同样的 RTT 下吞吐大致翻三倍。
+// 返回的是**分片数组**而不是合并后的大 Uint8Array —— 直接交给 new Blob() 就不再有
+// 「先合成 35MB 再整段拷贝」这一步，省掉一份峰值内存（评审 P0-3 的一半）。
+const CHUNK_STEP = 192 * 1024;      // 媒体栈/兼容路径：与服务端 RANGE_CHUNK 对齐
+const BIG_STEP = 2 * 1024 * 1024;   // 客户端专用路径（配合 full=1）
+const PARALLEL = 3;                 // 并线路数：再多会挤占弱网带宽，收益递减
+
+// 单次区间请求：带重试，429 按服务端给的 Retry-After 退避（原来不看，直接三次报废）
+async function fetchRange(url, start, end, signal) {
+  let lastErr = null;
+  for (let tries = 0; tries < 3; tries++) {
+    try {
+      const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` }, signal });
+      if (r.ok || r.status === 206) return r;
+      if (r.status === 429) {
+        const ra = Number(r.headers.get('retry-after') || 0);
+        const wait = ra > 0 ? Math.min(ra, 10) : 2;
+        dlog('range-429', { at: start, wait });
+        await new Promise((res) => setTimeout(res, wait * 1000));
+        lastErr = new Error('HTTP 429');
+        continue;
+      }
+      lastErr = new Error('HTTP ' + r.status);
+    } catch (e) {
+      lastErr = e;
+      if (signal && signal.aborted) throw e;
+    }
+    await new Promise((res) => setTimeout(res, 200 * (tries + 1)));
+  }
+  throw lastErr || new Error('取流失败 @' + start);
+}
+
+async function fetchBytesChunked(url, { onProgress, signal, parallel, big } = {}) {
   const t0 = Date.now();
+  const step = big ? BIG_STEP : CHUNK_STEP;
+  const P = Math.max(1, Math.min(parallel || 1, 4));
   const parts = [];
   let total = 0;
-  let pos = 0;
-  let rounds = 0;
-  while (rounds++ < 4000) {
-    const wantEnd = total ? Math.min(pos + CHUNK_STEP - 1, total - 1) : pos + CHUNK_STEP - 1;
-    let r = null;
-    let lastErr = null;
-    // 后台/弱网下单次请求可能被中途掐断：每片最多重试 3 次，别整首报废
-    for (let tries = 0; tries < 3; tries++) {
-      try {
-        r = await fetch(url, { headers: { Range: `bytes=${pos}-${wantEnd}` }, signal });
-        if (r.ok || r.status === 206) break;
-        lastErr = new Error('HTTP ' + r.status);
-        r = null;
-      } catch (e) {
-        lastErr = e;
-        r = null;
-        if (signal && signal.aborted) throw e;
+  let next = 0;      // 下一个待取区间的起点
+  let done = 0;      // 已收字节
+  let idx = 0;
+  let checked = false;
+  let stopped = false;
+
+  async function worker() {
+    while (!stopped) {
+      const start = next;
+      if (total && start >= total) return;
+      const wantEnd = total ? Math.min(start + step - 1, total - 1) : start + step - 1;
+      next = wantEnd + 1;
+      const my = idx++;
+      const r = await fetchRange(url, start, wantEnd, signal);
+      if (!checked) {
+        checked = true;
+        // 鉴权失效 / 错误页返回的不是音频，早拦掉，否则会造出 0 字节 blob
+        const ct = (r.headers.get('content-type') || '').toLowerCase();
+        if (!/audio|mp4|octet-stream/i.test(ct)) {
+          const t = await r.text().catch(() => '');
+          throw new Error('返回的不是音频(' + ct + '): ' + t.slice(0, 40));
+        }
       }
-      await new Promise((res) => setTimeout(res, 200 * (tries + 1)));
+      const buf = new Uint8Array(await r.arrayBuffer());
+      if (!buf.length) throw new Error('空响应 @' + start);
+      const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(r.headers.get('content-range') || '');
+      if (m) { if (Number(m[3])) total = Number(m[3]); }
+      else { total = start + buf.length; }     // 200 全量：一次收完
+      parts[my] = buf;                          // 按区间编号存，顺序天然正确
+      done += buf.length;
+      if (onProgress) onProgress(done, total, t0);
+      if (total && done >= total) return;
+      if (!total && done > 64 * 1024 * 1024) return;   // 无 total 时的保险丝
     }
-    if (!r) throw lastErr || new Error('取流失败 @' + pos);
-    if (!parts.length) {
-      // 鉴权失效 / 错误页返回的不是音频，早拦掉，否则会造出 0 字节 blob
-      const ct = (r.headers.get('content-type') || '').toLowerCase();
-      if (!/audio|mp4|octet-stream/i.test(ct)) {
-        const t = await r.text().catch(() => '');
-        throw new Error('返回的不是音频(' + ct + '): ' + t.slice(0, 40));
-      }
-    }
-    const buf = new Uint8Array(await r.arrayBuffer());
-    if (!buf.length) throw new Error('空响应 @' + pos);
-    const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(r.headers.get('content-range') || '');
-    parts.push(buf);
-    if (m) {
-      total = Number(m[3]) || total;
-      pos = Number(m[2]) + 1;
-    } else {
-      total = pos + buf.length;   // 200 全量（服务端忽略 Range）：一次收完
-      pos = total;
-    }
-    if (onProgress) onProgress(pos, total, t0);
-    if (total && pos >= total) break;
-    if (!total && pos > 64 * 1024 * 1024) break;   // 无 total 时的保险丝
   }
+
+  try {
+    await Promise.all(Array.from({ length: P }, () => worker()));
+  } finally {
+    stopped = true;
+  }
+  const out = parts.filter(Boolean);
+  if (!out.length) throw new Error('未取到音频数据');
+  return out;
+}
+
+function partsBytes(parts) {
   let n = 0;
   for (const p of parts) n += p.length;
-  if (!n) throw new Error('未取到音频数据');
-  const bytes = new Uint8Array(n);
-  let off = 0;
-  for (const p of parts) { bytes.set(p, off); off += p.length; }
-  return bytes;
+  return n;
 }
 
 function blobFromBytes(bytes) {
@@ -975,21 +1019,26 @@ function blobFromBytes(bytes) {
 
 async function fetchChunked(item, url) {
   const t0 = Date.now();
-  const bytes = await fetchBytesChunked(url, {
+  const parts = await fetchBytesChunked(url, {
+    big: true,
+    parallel: PARALLEL,
     onProgress: (got, total, t0_) => {
       const mb = (n) => Math.round((n / 1048576) * 10) / 10;
       const eta = Math.round((Date.now() - t0_) / got * (total - got) / 1000);
       toast(`下载音频 ${mb(got)}MB / ${mb(total)}MB（约 ${eta}s）`);
     },
   });
-  blobFromBytes(bytes);
+  blobFromBytes(parts);
   const a = A();
   const at = pendingStart || 0;
   a.src = blobUrl;
   pendingStart = 0;
   try { if (at > 0) a.currentTime = at; } catch {}
   await a.play();
-  dlog('blob-ok', { cid: item && item.cid, bytes: bytes.length, ms: Date.now() - t0, mode: 'chunked' });
+  dlog('blob-ok', {
+    cid: item && item.cid, bytes: partsBytes(parts), ms: Date.now() - t0,
+    mode: 'chunked', par: PARALLEL, chunks: parts.length,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -998,16 +1047,16 @@ async function fetchChunked(item, url) {
 // iOS 只解析出 20s，切过去一样坏），所以远程干脆不用备用元素，
 // 改成纯字节预取 —— 切歌时 blob 秒建，体验与局域网换元素相当。
 // ---------------------------------------------------------------------------
-let remotePreload = null;   // { key, bytes }
+let remotePreload = null;   // { key, parts }
 function preloadNextRemote(n) {
   const key = `${n.bvid}|${n.cid}`;
   if (remotePreload && remotePreload.key === key) return;
-  const url = apiUrl(`/api/play?bvid=${encodeURIComponent(n.bvid)}&cid=${encodeURIComponent(n.cid)}`);
-  const my = { key, bytes: null };
+  const url = apiUrl(`/api/play?bvid=${encodeURIComponent(n.bvid)}&cid=${encodeURIComponent(n.cid)}&full=1`);
+  const my = { key, parts: null };
   remotePreload = my;
-  fetchBytesChunked(url).then((bytes) => {
-    if (remotePreload === my) my.bytes = bytes;
-    dlog('rp-ok', { cid: n.cid, bytes: bytes.length });
+  fetchBytesChunked(url, { big: true, parallel: PARALLEL }).then((parts) => {
+    if (remotePreload === my) my.parts = parts;
+    dlog('rp-ok', { cid: n.cid, bytes: partsBytes(parts), chunks: parts.length });
   }).catch((e) => {
     if (remotePreload === my) remotePreload = null;
     dlog('rp-fail', { cid: n.cid, msg: String(e).slice(0, 60) });
@@ -1273,6 +1322,37 @@ function setMSPlaybackState(s) {
   try { navigator.mediaSession.playbackState = s; } catch {}
 }
 
+// 锁屏「上一首/下一首」必须走 advance()，不能自己算索引：
+//   a) 随机模式下 playIndex(current+1) 播的是队列里的下一首，不是随机下一首 —— 语义错；
+//   b) 单曲循环模式下应该重播本首，而不是跳走；
+//   c) 顺序模式到队尾时 playIndex(越界) 会静默失败 —— 表现就是「锁屏点了没反应」。
+// advance() 内部已经按 playMode 处理了全部四种情况，这里复用它。
+const MS_SKIP = 15;
+function msNext() { advance('ms-next'); }
+
+function msPrev() {
+  const a = A();
+  // 与主流播放器一致：已经听了 3 秒以上，「上一首」= 重头听这一首
+  if (a.currentTime > 3) {
+    try { a.currentTime = 0; syncPositionState(true); } catch {}
+    return;
+  }
+  if (!queue.length) return;
+  if (playMode === 'shuffle') { advance('ms-prev'); return; }
+  let idx = current - 1;
+  if (idx < 0) idx = playMode === 'loop' ? queue.length - 1 : 0;
+  playIndex(idx);
+}
+
+function msSeekBy(delta) {
+  const a = A();
+  if (!a.duration) return;
+  try {
+    a.currentTime = Math.max(0, Math.min(a.currentTime + delta, a.duration));
+    syncPositionState(true);
+  } catch {}
+}
+
 function updateMediaSession(item) {
   if (!('mediaSession' in navigator)) return;
   try {
@@ -1280,12 +1360,32 @@ function updateMediaSession(item) {
       title: item.title || '未知标题',
       artist: item.author || '',
       album: 'B站音乐 · 随身听',
-      artwork: item.pic ? [{ src: item.pic, sizes: '512x512', type: 'image/jpeg' }] : [],
+      artwork: item.pic ? [
+        { src: item.pic, sizes: '512x512', type: 'image/jpeg' },
+        { src: item.pic, sizes: '256x256', type: 'image/jpeg' },
+      ] : [],
     });
     navigator.mediaSession.setActionHandler('play', () => A().play().catch(() => {}));
     navigator.mediaSession.setActionHandler('pause', () => A().pause());
-    navigator.mediaSession.setActionHandler('previoustrack', () => playIndex(current - 1));
-    navigator.mediaSession.setActionHandler('nexttrack', () => playIndex(current + 1));
+    navigator.mediaSession.setActionHandler('previoustrack', msPrev);
+    navigator.mediaSession.setActionHandler('nexttrack', msNext);
+    // 快进 / 快退 / 定位：有这几个，iOS 控制中心与 CarPlay 才显示进度条并允许拖动
+    try {
+      navigator.mediaSession.setActionHandler('seekbackward', (d) => msSeekBy(-((d && d.seekOffset) || MS_SKIP)));
+      navigator.mediaSession.setActionHandler('seekforward', (d) => msSeekBy((d && d.seekOffset) || MS_SKIP));
+      navigator.mediaSession.setActionHandler('seekto', (d) => {
+        const a = A();
+        if (!a.duration || !d || d.seekTime == null) return;
+        try {
+          a.currentTime = Math.max(0, Math.min(d.seekTime, a.duration));
+          syncPositionState(true);
+        } catch {}
+      });
+      navigator.mediaSession.setActionHandler('stop', () => {
+        try { A().pause(); A().currentTime = 0; } catch {}
+        setPlayIcon(false);
+      });
+    } catch {}
   } catch {}
 }
 

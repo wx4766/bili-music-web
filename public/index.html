@@ -2,7 +2,9 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+  <!-- 不再锁死缩放：maximum-scale=1.0 / user-scalable=no 会让视力不佳的人（和车上瞥一眼的场景）
+       完全没法放大。布局本身是 390px 定宽居中，放大不会破版。 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <!-- B 站图床防盗链：不带 Referer 才放行，必须声明 no-referrer -->
   <meta name="referrer" content="no-referrer" />
   <meta name="theme-color" content="#101113" />

@@ -49,7 +49,7 @@ desktop_applaunchname={appname}.main
 install_dep_apps=nodejs_v22
 ctl_stop=true
 checkport=false
-changelog=首个版本：搜索 / 热门榜单 / 多收藏夹 / 歌词多源 / 断点续播 / 服务端音频缓存。
+changelog=v1.2.0：锁屏补齐进度拖动/快进快退，切歌指令走统一入口（随机、单曲、队尾不再没反应）；远程下载改并行大分片，弱网起播更快；控件热区补到 44px 并放开双指缩放；支持前面挂 Caddy 上 HTTPS（PWA 与锁屏封面才真正可用）；口令改表单登录，cookie 加 HttpOnly/Secure。v1.1.0：跨实例写锁、日志脱敏、字体本地化。
 """.format(appname=APPNAME, version=VERSION)
 
 PRIVILEGE = {

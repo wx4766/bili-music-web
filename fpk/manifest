@@ -1,5 +1,5 @@
 appname=bilimusic
-version=1.1.0
+version=1.2.0
 display_name=B站音乐
 desc=自托管 B 站音乐播放器：搜索、热门、收藏夹、歌词、断点续播，手机浏览器与 PWA 随身听。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_applaunchname=bilimusic.main
 install_dep_apps=nodejs_v22
 ctl_stop=true
 checkport=false
-changelog=v1.1.0：跨实例写锁（多实例共享数据目录不再写丢收藏与续播位置）；访问日志脱敏且日志读取加白名单校验；字体改为系统栈，去掉外部字体请求；仓库瘦身。v1.0.9：首个版本：搜索 / 热门榜单 / 多收藏夹 / 歌词多源 / 断点续播 / 服务端音频缓存。
+changelog=v1.2.0：锁屏补齐进度拖动/快进快退，切歌指令走统一入口（随机、单曲、队尾不再没反应）；远程下载改并行大分片，弱网起播更快；控件热区补到 44px 并放开双指缩放；支持前面挂 Caddy 上 HTTPS（PWA 与锁屏封面才真正可用）；口令改表单登录，cookie 加 HttpOnly/Secure。v1.1.0：跨实例写锁、日志脱敏、字体本地化。
