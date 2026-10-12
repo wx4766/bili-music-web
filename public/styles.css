@@ -13,8 +13,11 @@
   --dim:       #7d838c;
   --pink:      #fb7299;
   --pink-dim:  rgba(251,114,153,.14);
-  --sans: "Noto Sans SC","PingFang SC","Helvetica Neue",sans-serif;
-  --mono: "IBM Plex Mono","SF Mono",ui-monospace,monospace;
+  /* 系统字体栈：不再依赖 fonts.googleapis.com。
+     iOS 上 -apple-system / PingFang SC 就是中文最优解，零网络、零 FOIT。
+     英文等宽用 ui-monospace（iOS = SF Mono，Windows = Consolas 系），观感与 IBM Plex Mono 接近。 */
+  --sans: -apple-system, BlinkMacSystemFont, system-ui, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --safe-b: env(safe-area-inset-bottom, 0px);
 }
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}

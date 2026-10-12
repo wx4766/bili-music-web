@@ -22,13 +22,26 @@
 | **服务端音频缓存** | 听过的歌落盘复用，二次播放秒开，也省上行带宽 |
 | **iOS 友好** | 服务端自动把 DASH 分片音频重混为标准 MP4（`faststart`），避免 iOS Safari 只能解析前 20 秒的问题 |
 | **PWA** | 支持"添加到主屏幕"，锁屏控制（`Media Session`）正常 |
-| **零依赖** | 只用 Node 标准库（≥18），Docker 镜像 ~50MB |
+| **零依赖** | 只用 Node 标准库（≥18）；Docker 镜像已内置 ffmpeg |
 
 移动端界面：
 
 | 搜索 | 结果 | 桌面布局 |
 |---|---|---|
 | ![搜索](bili_search.png) | ![结果](bili_results.png) | ![桌面](bili_desktop.png) |
+
+---
+
+## 环境要求
+
+| 项 | 要求 | 说明 |
+|---|---|---|
+| Node.js | ≥ 18（用到全局 `fetch` / `AbortController`） | Docker 方式不需要本机安装 |
+| ffmpeg | 可选，但**强烈建议** | 把 B 站 DASH 分片音频重混为标准 MP4（`-c copy -movflags +faststart`）。**缺了它 iPhone 上会出现「一首歌只播十几秒」，而且不会报任何错**。Docker 镜像已内置；Node 直跑时请确保 `ffmpeg` 在 PATH，或用 `FFMPEG_BIN` 指定路径 |
+| 网络 | 服务端能访问 `bilibili.com` | 取流、搜索、歌词都由服务端发起，手机端只跟你的服务器通信 |
+
+> **自检**：不管用哪种方式，先跑 `curl http://<地址>/api/health`，
+> 返回 `{"ok":true,...}` 说明服务端已经正常工作；打不开就先看这一条，别急着查前端。
 
 ---
 
@@ -40,6 +53,7 @@
 git clone https://github.com/wx4766/bili-music-web.git
 cd bili-music-web
 docker compose up -d
+curl http://localhost:8360/api/health     # 自检：应返回 {"ok":true,...}
 ```
 
 打开 `http://<你的机器IP>:8360/`。收藏与缓存写在 `./data`（已挂载为卷）。
@@ -49,7 +63,10 @@ docker compose up -d
 ```bash
 node server.js
 # 默认 http://localhost:3000
+curl http://localhost:3000/api/health
 ```
+
+注意：这种方式下 iOS 能否正常听完整首，取决于本机有没有 ffmpeg（见「环境要求」）。
 
 ### 方式三：飞牛 fnOS 应用包
 
@@ -60,6 +77,16 @@ node server.js
 cd fpk
 python build_fpk.py          # 需要 fnpack + Pillow
 ```
+
+装好后打开 `https://<NAS>:5667/app/bilimusic/`，能看到热门列表即自检通过。
+
+---
+
+## 路线图
+
+已完成的加固项与后续计划见 [docs/ROADMAP.md](docs/ROADMAP.md)：
+多专家评审后收敛的 ≈40 条问题清单，按 P0 / P1 / P2 与三阶段排期。
+第一波「止血与卫生」（跨实例写锁、日志脱敏、字体本地化、Docker 补 ffmpeg）已在 v1.1.0 完成。
 
 ---
 

@@ -19,9 +19,9 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="B站音乐" />
   <title>B站音乐 · 随身听</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
+  <!-- 字体全走系统栈（见 styles.css 的 --sans / --mono）：
+       不再请求 fonts.googleapis.com —— 手机上这个域名常年超时，
+       会把首屏渲染白白压住几秒，而中文本来就该用系统字体。 -->
   <link rel="stylesheet" href="styles.css" />
   <!-- 统一网关前缀由服务端注入（%BASE%），根路径部署时为空串 -->
 </head>

@@ -61,6 +61,68 @@ const DL_TIMEOUT_MS = 5 * 60 * 1000;
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const HISTORY_MAX = 60;
 
+// ---------------------------------------------------------------------------
+// 跨实例协调（v1.1.0）：同一份 DATA_DIR 可能被多个实例共享
+// 典型场景 = fnOS 网关实例（/app/bilimusic）+ 远程直连实例（:8361）同时跑。
+// 三个真实风险：
+//   a) 两个进程写同一个 .tmp：一个 O_TRUNC 会截断另一个正在写的流 → 文件损坏；
+//   b) 启动清理 / LRU 清扫删掉别的实例正在下载或正在读的文件 → 缓存失效甚至播放中断；
+//   c) playlists / history 的「读-改-写」交错 → 丢更新。
+// 对策：临时文件一律带 process.pid；写 JSON 走目录锁（mkdir 是原子的）；
+//       清理残留前先确认持有者进程还在不在。
+// ---------------------------------------------------------------------------
+function pidAlive(pid) {
+  if (!pid || !Number.isFinite(pid)) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// "40284065742.m4a.1234.part" -> 1234；老格式（不带 pid）返回 0
+function ownerPidOf(name) {
+  const m = String(name).match(/\.(\d+)\.(?:tmp|part|remux)$/);
+  return m ? Number(m[1]) : 0;
+}
+
+// 别的实例正在写的文件不能碰
+function heldByOtherInstance(name) {
+  const owner = ownerPidOf(name);
+  return owner > 0 && owner !== process.pid && pidAlive(owner);
+}
+
+const LOCK_DIR = path.join(DATA_DIR, '.locks');
+
+// 同步小睡：写 JSON 是同步路径，竞争时等 20ms 再试（Atomics.wait 不占用事件循环线程争用）
+function syncSleep(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {}
+}
+
+// 拿不到锁就返回 null（调用方跳过写入并告警），绝不无限等待卡死播放请求
+function acquireDataLock(name, staleMs = 15000) {
+  const d = path.join(LOCK_DIR, name + '.lock');
+  try { fs.mkdirSync(LOCK_DIR, { recursive: true }); } catch {}
+  for (let i = 0; i < 25; i++) {
+    try {
+      fs.mkdirSync(d);
+      try { fs.writeFileSync(path.join(d, 'owner'), String(process.pid)); } catch {}
+      return d;
+    } catch {
+      // 锁已存在：持有者进程已死、或占用超过 staleMs（异常退出遗留）→ 强抢
+      let steal = false;
+      try {
+        const owner = Number(String(fs.readFileSync(path.join(d, 'owner'), 'utf8')).trim());
+        const age = Date.now() - fs.statSync(d).mtimeMs;
+        if (!pidAlive(owner) || age > staleMs) steal = true;
+      } catch { steal = true; }
+      if (steal) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} continue; }
+      syncSleep(20);
+    }
+  }
+  return null;
+}
+
+function releaseDataLock(d) {
+  if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+}
+
 // 前端诊断日志（iOS 后台连播定位用）：前端把事件流水批量 POST 上来落盘，
 // 手机实测完直接读这份 jsonl 复盘。单文件超过 4MB 轮转。
 const LOG_DIR = path.join(DATA_DIR, 'logs');
@@ -951,7 +1013,7 @@ async function remuxDashToFaststart(file) {
   if (!head.includes(Buffer.from('dash'))) return false;
   remuxInFlight.add(file);
   try {
-    const tmp = file + '.remux';
+    const tmp = `${file}.${process.pid}.remux`;
     try { fs.unlinkSync(tmp); } catch {}
     const ok = await new Promise((resolve) => {
       try {
@@ -985,7 +1047,7 @@ function downloadToCache(cid, candidates) {
   if (pendingDownloads.has(key)) return;
   const file = audioCacheFile(cid);
   const task = (async () => {
-    const tmp = file + '.part';
+    const tmp = `${file}.${process.pid}.part`;
     let saved = false;
     try {
       ensureAudioCacheDir();
@@ -1193,9 +1255,14 @@ function readPlaylists() {
 
 function writePlaylists(data) {
   ensureDataDir();
-  const tmp = PL_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, PL_FILE);
+  const lock = acquireDataLock('playlists');
+  if (!lock) { console.warn('[playlists] 写入跳过：未能在 500ms 内拿到数据锁'); return false; }
+  try {
+    const tmp = `${PL_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, PL_FILE);
+    return true;
+  } finally { releaseDataLock(lock); }
 }
 
 // 最近播放 / 续播进度。history.json：{ items:[ {bvid,cid,title,author,pic,duration,lyricKey,position,updatedAt} ] }
@@ -1211,9 +1278,14 @@ function readHistory() {
 
 function writeHistory(h) {
   ensureDataDir();
-  const tmp = HISTORY_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(h, null, 2));
-  fs.renameSync(tmp, HISTORY_FILE);
+  const lock = acquireDataLock('history');
+  if (!lock) { console.warn('[history] 写入跳过：未能在 500ms 内拿到数据锁'); return false; }
+  try {
+    const tmp = `${HISTORY_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(h, null, 2));
+    fs.renameSync(tmp, HISTORY_FILE);
+    return true;
+  } finally { releaseDataLock(lock); }
 }
 
 // 对外只暴露摘要（不含 items），避免列表多时一次拉太多
@@ -1269,6 +1341,31 @@ function parseCookieHeader(h) {
   return o;
 }
 
+// 前端诊断日志里可能带 location.href（含 ?k=），落盘前递归打码
+function redactSecrets(v, depth = 0) {
+  if (!ACCESS_TOKEN || depth > 6) return v;
+  if (typeof v === 'string') return v.includes(ACCESS_TOKEN) ? v.split(ACCESS_TOKEN).join('***') : v;
+  if (Array.isArray(v)) return v.map((x) => redactSecrets(x, depth + 1));
+  if (v && typeof v === 'object') {
+    const o = {};
+    for (const [k, val] of Object.entries(v)) o[k] = redactSecrets(val, depth + 1);
+    return o;
+  }
+  return v;
+}
+
+// /api/log?f= 只允许读日志目录里的 .log 文件：
+// 直接把参数拼进 path.join 等于开放任意文件读取（?f=../../../etc/passwd）。
+function safeLogName(n) {
+  if (!n) return '';
+  const s = String(n);
+  if (s !== path.basename(s)) return '';            // 任何带 / 或 .. 的一律拒绝
+  if (!/^[A-Za-z0-9._-]+\.log$/.test(s)) return ''; // 只认日志文件
+  const root = path.resolve(LOG_DIR);
+  const full = path.resolve(root, s);
+  return full.startsWith(root + path.sep) ? s : '';
+}
+
 async function handleApi(req, res, url) {
   const p = url.pathname;
   const q = url.searchParams;
@@ -1314,7 +1411,7 @@ async function handleApi(req, res, url) {
           const st = fs.statSync(path.join(LOG_DIR, f));
           return { f, size: st.size, mtime: st.mtimeMs };
         }).sort((a, b) => b.mtime - a.mtime);
-        const want = q.get('f') || stats[0].f;
+        const want = safeLogName(q.get('f')) || stats[0].f;
         const n = Math.min(Number(q.get('n') || 200), 3000);
         const raw = fs.readFileSync(path.join(LOG_DIR, want), 'utf8').trim().split('\n');
         return sendJson(res, 200, {
@@ -1343,7 +1440,7 @@ async function handleApi(req, res, url) {
           if (rotate) {
             try { fs.renameSync(file, file.replace(/\.log$/, '.1.log')); } catch {}
           }
-          fs.appendFileSync(file, arr.map((r) => JSON.stringify(r)).join('\n') + '\n');
+          fs.appendFileSync(file, arr.map((r) => JSON.stringify(redactSecrets(r))).join('\n') + '\n');
           written = arr.length;
         } catch (e) {
           console.warn('[log] write failed: ' + e.message);
@@ -1824,6 +1921,30 @@ function stripBase(url) {
   return url;
 }
 
+// 脱敏：URL / Referer 里可能带口令（?k=xxx）、SESSDATA 之类，落盘前一律打码。
+// 日志会被打包发给别人复盘，明文口令等于把家门钥匙贴出去。
+const SECRET_QUERY_KEYS = new Set([
+  'k', 'token', 'access_token', 'accesstoken', 'bm_k', 'key', 'pwd',
+  'password', 'passwd', 'secret', 'sessdata', 'bili_jct', 'credential',
+]);
+
+function redactUrl(u) {
+  let s = String(u || '');
+  if (!s) return s;
+  // 兜底：口令字符串本身出现在任何位置都要抹掉
+  if (ACCESS_TOKEN && s.includes(ACCESS_TOKEN)) s = s.split(ACCESS_TOKEN).join('***');
+  const i = s.indexOf('?');
+  if (i < 0) return s;
+  const base = s.slice(0, i);
+  const qs = s.slice(i + 1).split('&').map((kv) => {
+    const p = kv.indexOf('=');
+    const k = (p < 0 ? kv : kv.slice(0, p)).toLowerCase();
+    return SECRET_QUERY_KEYS.has(k) ? (p < 0 ? kv : kv.slice(0, p) + '=***') : kv;
+  }).join('&');
+  return base + '?' + qs;
+}
+
+// ---------------------------------------------------------------------------
 // 服务端访问日志（v1.0.3）：网关转发模式下排查「App 内能开页面但 API 全空」
 // 这类问题必须看到网关转发来的真实请求：路径形态 / UA / 有无凭据头。
 // 记录：时间 方法 原始路径 状态码 UA Referer 凭据线索。4MB 轮转，读数走 /api/log。
@@ -1843,7 +1964,7 @@ function accessLog(req, res, rawUrl) {
     const line = JSON.stringify({
       t: new Date().toISOString(),
       m: req.method,
-      u: String(rawUrl).slice(0, 200),
+      u: redactUrl(rawUrl).slice(0, 200),
       s: res.statusCode,
       // 音频请求这条最关键：回放是否命中本地缓存、range 处理策略
       ac: res.getHeader ? (res.getHeader('x-audio-cache') || undefined) : undefined,
@@ -1851,7 +1972,7 @@ function accessLog(req, res, rawUrl) {
       rg: String(h.range || '').slice(0, 40) || undefined,
       cl: res.getHeader ? (res.getHeader('content-length') || undefined) : undefined,
       ua: String(h['user-agent'] || '').slice(0, 120),
-      ref: String(h.referer || '').slice(0, 120),
+      ref: redactUrl(h.referer).slice(0, 160),
       ...cred,
     });
     const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -1909,6 +2030,8 @@ try {
   fs.mkdirSync(LOG_DIR, { recursive: true }); // 访问日志目录，第一条请求就要写
   for (const f of fs.readdirSync(AUDIO_CACHE_DIR)) {
     if (f.endsWith('.part') || f.endsWith('.remux')) {
+      // 别的实例正在下载的半成品不能删（否则它白下一遍，用户侧表现为缓存迟迟不生效）
+      if (heldByOtherInstance(f)) continue;
       try { fs.unlinkSync(path.join(AUDIO_CACHE_DIR, f)); } catch {}
     }
   }

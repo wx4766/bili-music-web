@@ -10,6 +10,9 @@ data-test/
 fpk/app/
 *.fpk
 
+# 设计草稿（UI 选型过程的三个方案与截图，本地留档，不进仓库）
+design-demos/
+
 # 依赖与环境
 node_modules/
 .env
