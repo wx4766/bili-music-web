@@ -49,7 +49,7 @@ desktop_applaunchname={appname}.main
 install_dep_apps=nodejs_v22
 ctl_stop=true
 checkport=false
-changelog=v1.2.0：锁屏补齐进度拖动/快进快退，切歌指令走统一入口（随机、单曲、队尾不再没反应）；远程下载改并行大分片，弱网起播更快；控件热区补到 44px 并放开双指缩放；支持前面挂 Caddy 上 HTTPS（PWA 与锁屏封面才真正可用）；口令改表单登录，cookie 加 HttpOnly/Secure。v1.1.0：跨实例写锁、日志脱敏、字体本地化。
+changelog=v1.2.1：修复远程/外网「点了歌起不来」—— 并行分片在拿到文件总长前就排区间，第三路的起点飞过文件末尾导致服务端回 416，小于 6MB 的歌几乎必现；改为先取首块拿到总长再精确切块。顺带加固：Caddy 收到证书里没有的主机名不再直接断 TLS。v1.2.0：锁屏补齐进度拖动/快进快退，切歌指令走统一入口（随机、单曲、队尾不再没反应）；远程下载改并行大分片，弱网起播更快；控件热区补到 44px 并放开双指缩放；支持前面挂 Caddy 上 HTTPS（PWA 与锁屏封面才真正可用）；口令改表单登录，cookie 加 HttpOnly/Secure。v1.1.0：跨实例写锁、日志脱敏、字体本地化。
 """.format(appname=APPNAME, version=VERSION)
 
 PRIVILEGE = {

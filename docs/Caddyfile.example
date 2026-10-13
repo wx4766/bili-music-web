@@ -31,6 +31,17 @@ https://192.168.1.50:8361 {
 	}
 }
 
+# 兜底站点（host 不写死）——强烈建议留着。
+# 实测：任何**证书里没有**的主机名过来，Caddy 既不发证也不回退，直接甩
+# TLS alert 80（internal error），浏览器只显示"连不上"，极难排查。
+# DDNS 换名、临时用别的域名访问时就会撞上。加了这一块，任何 SNI 都能正常握手。
+https://:8361 {
+	tls /etc/caddy/certs/bilimusic.crt /etc/caddy/certs/bilimusic.key
+	reverse_proxy 127.0.0.1:8362 {
+		flush_interval -1
+	}
+}
+
 # —— 自建 CA（iOS 要信任才不弹警告，且 PWA 才可能生效）——
 #   # 根 CA
 #   openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 3650 \

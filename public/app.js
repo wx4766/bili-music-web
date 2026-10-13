@@ -937,6 +937,9 @@ async function fetchRange(url, start, end, signal) {
     try {
       const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` }, signal });
       if (r.ok || r.status === 206) return r;
+      // 416 = 我们排的区间越界了（服务端严格按 RFC 回的）。重试没有任何意义，
+      // 立刻抛出去，好让日志里留下真凶而不是淹没在三次无效重试里。
+      if (r.status === 416) throw new Error('HTTP 416 @bytes=' + start);
       if (r.status === 429) {
         const ra = Number(r.headers.get('retry-after') || 0);
         const wait = ra > 0 ? Math.min(ra, 10) : 2;
@@ -949,6 +952,7 @@ async function fetchRange(url, start, end, signal) {
     } catch (e) {
       lastErr = e;
       if (signal && signal.aborted) throw e;
+      if (/HTTP 416/.test(String(e && e.message))) throw e;
     }
     await new Promise((res) => setTimeout(res, 200 * (tries + 1)));
   }
@@ -959,51 +963,67 @@ async function fetchBytesChunked(url, { onProgress, signal, parallel, big } = {}
   const t0 = Date.now();
   const step = big ? BIG_STEP : CHUNK_STEP;
   const P = Math.max(1, Math.min(parallel || 1, 4));
-  const parts = [];
-  let total = 0;
-  let next = 0;      // 下一个待取区间的起点
-  let done = 0;      // 已收字节
-  let idx = 0;
-  let checked = false;
-  let stopped = false;
 
+  // ① 第一块兼作「探测」——必须**先**知道文件总长，才敢多线程排区间。
+  //   2026-10-13 外网真机实锤：上一版 3 路 worker 在首片响应回来（total 才有值）
+  //   之前就各自盲目排区间，第 3 路的起点直接飞过文件末尾，服务端按 RFC 回 416，
+  //   整条 blob 路径报废 → iPhone 上就是「点了歌半天起不来」。
+  //   为什么会漏测：内网走媒体栈路径（本地 home name）根本不进这里；
+  //   而远程冒烟挑中的恰好是不足 2MB 的小文件，只够一个 worker，永不越界。
+  const first = await fetchRange(url, 0, step - 1, signal);
+  const ct = (first.headers.get('content-type') || '').toLowerCase();
+  if (!/audio|mp4|octet-stream/i.test(ct)) {
+    // 鉴权失效 / 错误页返回的不是音频，早拦掉，否则会造出 0 字节 blob
+    const t = await first.text().catch(() => '');
+    throw new Error('返回的不是音频(' + ct + '): ' + t.slice(0, 40));
+  }
+  const firstBuf = new Uint8Array(await first.arrayBuffer());
+  if (!firstBuf.length) throw new Error('未取到音频数据');
+  const fm = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(first.headers.get('content-range') || '');
+  if (!fm || !Number(fm[3])) {
+    // 服务端没给总长（忽略 Range、200 全量吐回来了）：一次就收完，也没有并行余地
+    if (onProgress) onProgress(firstBuf.length, firstBuf.length, t0);
+    return [firstBuf];
+  }
+  const total = Number(fm[3]);
+  let done = firstBuf.length;
+  if (onProgress) onProgress(Math.min(done, total), total, t0);
+  let pos = Number(fm[2]) + 1;      // 按服务端**实际**给的末字节推进（它可能截得更小）
+  if (pos >= total) return [firstBuf];
+
+  // ② 拿到总长后再精确切块：每块的 end 都 clamp 到 total-1 —— 从根上不可能越界
+  const blocks = [];
+  for (let s = pos; s < total; s += step) blocks.push([s, Math.min(s + step - 1, total - 1)]);
+  const slots = new Array(blocks.length).fill(null);   // 按块号落位：谁先回来都不打乱顺序
+  let cursor = 0;
   async function worker() {
-    while (!stopped) {
-      const start = next;
-      if (total && start >= total) return;
-      const wantEnd = total ? Math.min(start + step - 1, total - 1) : start + step - 1;
-      next = wantEnd + 1;
-      const my = idx++;
-      const r = await fetchRange(url, start, wantEnd, signal);
-      if (!checked) {
-        checked = true;
-        // 鉴权失效 / 错误页返回的不是音频，早拦掉，否则会造出 0 字节 blob
-        const ct = (r.headers.get('content-type') || '').toLowerCase();
-        if (!/audio|mp4|octet-stream/i.test(ct)) {
-          const t = await r.text().catch(() => '');
-          throw new Error('返回的不是音频(' + ct + '): ' + t.slice(0, 40));
-        }
+    for (;;) {
+      const i = cursor++;
+      if (i >= blocks.length) return;
+      const bs = blocks[i][0];
+      const be = blocks[i][1];
+      const acc = [];
+      let off = bs;
+      // 服务端仍可能把一块拆成多次吐（例如退回到 192KB 上限）：循环补齐这一块为止
+      while (off <= be) {
+        const r = await fetchRange(url, off, be, signal);
+        const b = new Uint8Array(await r.arrayBuffer());
+        if (!b.length) throw new Error('空响应 @' + off);
+        acc.push(b);
+        const mm = /bytes\s+(\d+)-(\d+)\//.exec(r.headers.get('content-range') || '');
+        off = mm ? Number(mm[2]) + 1 : be + 1;   // 无 content-range = 200 全量，到头了
+        done += b.length;
+        if (onProgress) onProgress(Math.min(done, total), total, t0);
       }
-      const buf = new Uint8Array(await r.arrayBuffer());
-      if (!buf.length) throw new Error('空响应 @' + start);
-      const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(r.headers.get('content-range') || '');
-      if (m) { if (Number(m[3])) total = Number(m[3]); }
-      else { total = start + buf.length; }     // 200 全量：一次收完
-      parts[my] = buf;                          // 按区间编号存，顺序天然正确
-      done += buf.length;
-      if (onProgress) onProgress(done, total, t0);
-      if (total && done >= total) return;
-      if (!total && done > 64 * 1024 * 1024) return;   // 无 total 时的保险丝
+      slots[i] = acc;
     }
   }
+  await Promise.all(Array.from({ length: P }, () => worker()));
 
-  try {
-    await Promise.all(Array.from({ length: P }, () => worker()));
-  } finally {
-    stopped = true;
-  }
-  const out = parts.filter(Boolean);
-  if (!out.length) throw new Error('未取到音频数据');
+  const out = [firstBuf];
+  for (const seg of slots) { for (const b of seg) out.push(b); }
+  const got = partsBytes(out);
+  if (got !== total) dlog('chunk-len-mismatch', { got, total });
   return out;
 }
 
