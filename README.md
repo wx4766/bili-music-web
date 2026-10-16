@@ -8,6 +8,24 @@
 
 ![播放页](bili_playing.png)
 
+## 它是什么、不是什么
+
+| | |
+|---|---|
+| ✅ 是 | 一个**跑在你自己机器上**的播放前端 + 音频代理。它不存任何音频版权内容，所有音频实时来自 B 站公开接口，只做转发与本地缓存 |
+| ❌ 不是 | 下载站、破解工具、B 站账号登录器（走游客取流，听不了大会员专属音源） |
+| 🎯 适合 | 家里有台常开的 NAS/小主机，想在 iPhone / Android 上随手听，且希望数据（收藏夹、播放进度）握在自己手里 |
+
+**两件事上手前就该决定**——它们会直接影响能不能用：
+
+1. **要不要上 HTTPS**。**要**，除非只在局域网 `http://` 里用。iOS Safari 只在安全上下文注册
+   Service Worker：不上 HTTPS，「添加到主屏幕」就只是个快捷方式，离线、锁屏封面、cookie
+   `Secure` 全都拿不到，口令也是明文过公网。做法是前端挂一层 Caddy 做 TLS 终结（见下）。
+2. **要不要设口令**。**暴露到公网就必须设** `ACCESS_TOKEN`。不设的话，任何人都能拿你的机器
+   当「任意 BV 号的 B 站音频代理」，还能删掉你的收藏夹。
+   v1.3 起更严格：**独立端口模式下没设口令会直接拒绝启动**（fail-closed），
+   真要在纯内网裸跑才需要显式 `ALLOW_NO_TOKEN=1`。
+
 ---
 
 ## 特性
@@ -23,6 +41,8 @@
 | **iOS 友好** | 服务端自动把 DASH 分片音频重混为标准 MP4（`faststart`），避免 iOS Safari 只能解析前 20 秒的问题 |
 | **PWA** | 支持"添加到主屏幕"，锁屏控制（`Media Session`）正常 |
 | **零依赖** | 只用 Node 标准库（≥18）；Docker 镜像已内置 ffmpeg |
+| **数据不容易丢** | 收藏夹 JSON 写入走"临时文件 + fsync + rename"，损坏时改名保留现场而不回写空数据；写失败返回 503 让前端提示，而不是假装成功 |
+| **不会自己拖垮自己** | B 站请求统一超时、下载有并发闸门、磁盘剩余不足 2GB 就不再写缓存、`/api/health` 如实报告磁盘/ffmpeg 状态 |
 
 移动端界面：
 
@@ -85,8 +105,13 @@ python build_fpk.py          # 需要 fnpack + Pillow
 ## 路线图
 
 已完成的加固项与后续计划见 [docs/ROADMAP.md](docs/ROADMAP.md)：
-多专家评审后收敛的 ≈40 条问题清单，按 P0 / P1 / P2 与三阶段排期。
-第一波「止血与卫生」（跨实例写锁、日志脱敏、字体本地化、Docker 补 ffmpeg）已在 v1.1.0 完成。
+多专家评审后收敛的问题清单，按 P0 / P1 / P2 与分波排期。
+
+| 版本 | 内容 |
+|---|---|
+| v1.1.0 | 第一波「止血与卫生」：跨实例写锁、日志脱敏、字体本地化、Docker 补 ffmpeg |
+| v1.2.x | 第二波「体验」：锁屏 Media Session、远程并行大分片、热区 ≥44px、Caddy HTTPS、口令改表单登录 |
+| v1.3.0 | 第三波「韧性」：收藏夹写入原子化与损坏现场保留、B 站请求统一超时、下载并发闸门与磁盘水位、鉴权 fail-closed、`/api/health` 报真话、缓存定期维护 |
 
 ---
 
@@ -102,6 +127,46 @@ python build_fpk.py          # 需要 fnpack + Pillow
 | `BASE_PATH` | 空 | 反向代理前缀，如 `/app/bilimusic`；根路径部署留空 |
 | `ACCESS_TOKEN` | 空 | 设置后启用访问口令（见下）。**暴露到公网时强烈建议设置** |
 | `FFMPEG_BIN` | `/usr/bin/ffmpeg` | 用于 iOS 音频重混；找不到 ffmpeg 时自动跳过重混 |
+| `ALLOW_NO_TOKEN` | 空 | 设为 `1` 才允许"独立端口 + 无口令"启动。默认该组合**拒绝启动** |
+| `BILI_TIMEOUT_MS` | `10000` | 单个 B 站请求的超时。网络差可适当调大，别调太小（正常取流也要几百毫秒） |
+| `DL_CONCURRENCY` | `2` | 同时进行的音频缓存下载数。小主机建议保持 2；调大只会让磁盘抖 |
+| `MAX_CACHE_BYTES` | `1610612736`（1.5GB） | 音频缓存总上限，超出按 LRU 淘汰最久没听的 |
+| `MAX_CACHE_FILES` | `200` | 音频缓存文件数上限（与上一条取先到者） |
+
+### 长期运行（systemd + 看门狗）
+
+一台常年开机的 NAS 上，最可能的故障不是代码 bug，而是"进程悄悄死了没人知道"。
+建议至少做两件事：
+
+1. **让 systemd 自己拉起来**，并放宽默认的重启限流。默认 `StartLimitBurst=5`
+   意味着启动即崩 5 次后 systemd 就永久放弃，服务躺平且没人报警：
+
+   ```ini
+   # /etc/systemd/system/bilimusic.service.d/10-selfheal.conf
+   [Unit]
+   StartLimitIntervalSec=300
+   StartLimitBurst=20
+
+   [Service]
+   Restart=always
+   RestartSec=5
+   ```
+
+2. **让它"报真话"并被盯着**。`GET /api/health` 会如实返回磁盘是否可写、剩余空间、
+   ffmpeg 是否可用（`ok:false` 时看 `checks` 字段）。挂个 cron 每 5 分钟探一次：
+
+   ```cron
+   */5 * * * * /usr/local/bin/bilimusic-watchdog.sh
+   ```
+
+   参考实现见 [`docs/watchdog.sh`](docs/watchdog.sh)。注意它**只在进程不响应时才重启**——
+   `ok:false` 但 HTTP 200（磁盘满、ffmpeg 缺失）只记录不重启，因为重启修不好这类问题，
+   只会变成无意义的重启风暴。
+
+另外建议把 `DATA_DIR` 定期做跨盘快照（收藏夹是你唯一的"自建数据"，
+音频缓存丢了可以再下）。参考脚本 [`docs/backup.sh`](docs/backup.sh)。
+
+---
 
 ### 访问口令
 
@@ -160,7 +225,8 @@ Environment=PORT=8362
 - **飞牛 App 内置浏览器不能出声**：飞牛手机 App 的 WebView 限制了音频播放，请用系统 Safari / Chrome 打开。
 - **HTTP 下 PWA 无法离线**：Service Worker 需要安全上下文（HTTPS 或 localhost）。
   想用「添加到主屏幕 + 离线 + 锁屏封面」，必须按上一节上 HTTPS。
-- 音频缓存默认上限 200 个文件 / 1.5 GB，超出按 LRU 清理。
+- 音频缓存默认上限 200 个文件 / 1.5 GB，超出按 LRU 清理（可用 `MAX_CACHE_FILES` / `MAX_CACHE_BYTES` 调整）。
+  磁盘剩余不足 2 GB 时会停止写入新缓存（缓存 miss 只是慢一点，收藏夹写不进去才是灾难）。
 
 ---
 

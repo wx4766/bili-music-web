@@ -21,3 +21,7 @@ node_modules/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 发布流程产物（GitHub PAT 与发布配置，绝不入库）
+_gh_token.txt
+oss-release.json

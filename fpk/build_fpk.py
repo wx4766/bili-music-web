@@ -32,7 +32,7 @@ FNPAK = os.environ.get(
 
 APPNAME = 'bilimusic'
 BASE_PATH = '/app/' + APPNAME
-VERSION = os.environ.get('FPK_VERSION', '1.0.0')
+VERSION = os.environ.get('FPK_VERSION', '1.3.0')
 
 MANIFEST = """appname={appname}
 version={version}
@@ -49,7 +49,7 @@ desktop_applaunchname={appname}.main
 install_dep_apps=nodejs_v22
 ctl_stop=true
 checkport=false
-changelog=v1.2.1：修复远程/外网「点了歌起不来」—— 并行分片在拿到文件总长前就排区间，第三路的起点飞过文件末尾导致服务端回 416，小于 6MB 的歌几乎必现；改为先取首块拿到总长再精确切块。顺带加固：Caddy 收到证书里没有的主机名不再直接断 TLS。v1.2.0：锁屏补齐进度拖动/快进快退，切歌指令走统一入口（随机、单曲、队尾不再没反应）；远程下载改并行大分片，弱网起播更快；控件热区补到 44px 并放开双指缩放；支持前面挂 Caddy 上 HTTPS（PWA 与锁屏封面才真正可用）；口令改表单登录，cookie 加 HttpOnly/Secure。v1.1.0：跨实例写锁、日志脱敏、字体本地化。
+changelog=v1.3.0：韧性加固。收藏夹/播放记录改为原子写入（临时文件+fsync+改名），JSON 损坏时改名保留现场而不是回写空数据，写入失败返回 503 让前端提示；B 站请求统一加超时，避免一条半开连接把搜索和取流全部挂死；下载加并发闸门与磁盘水位（剩余不足 2GB 就不再写缓存）；独立端口模式未设访问口令时拒绝启动（fail-closed）；/api/health 改为如实报告磁盘与 ffmpeg 状态；缓存每 6 小时做一次 LRU 与残留清理。v1.2.1：修复远程/外网「点了歌起不来」—— 并行分片在拿到文件总长前就排区间，第三路的起点飞过文件末尾导致服务端回 416，小于 6MB 的歌几乎必现；改为先取首块拿到总长再精确切块。顺带加固：Caddy 收到证书里没有的主机名不再直接断 TLS。v1.2.0：锁屏补齐进度拖动/快进快退，切歌指令走统一入口（随机、单曲、队尾不再没反应）；远程下载改并行大分片，弱网起播更快；控件热区补到 44px 并放开双指缩放；支持前面挂 Caddy 上 HTTPS（PWA 与锁屏封面才真正可用）；口令改表单登录，cookie 加 HttpOnly/Secure。v1.1.0：跨实例写锁、日志脱敏、字体本地化。
 """.format(appname=APPNAME, version=VERSION)
 
 PRIVILEGE = {

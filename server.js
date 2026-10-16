@@ -52,8 +52,9 @@ const LYRIC_FETCH_TIMEOUT_MS = 9000;
 
 // 服务端音频缓存：常听的歌落盘 NAS，二次播放秒开，也省 B 站请求和外网上行
 const AUDIO_CACHE_DIR = path.join(DATA_DIR, 'audio-cache');
-const MAX_CACHE_FILES = 200;
-const MAX_CACHE_BYTES = 1536 * 1024 * 1024; // 1.5 GB
+// 上限可配：小容量设备上把缓存压小，别让它跟照片/备份抢盘
+const MAX_CACHE_FILES = Math.max(10, Number(process.env.MAX_CACHE_FILES || 200));
+const MAX_CACHE_BYTES = Math.max(64 * 1024 * 1024, Number(process.env.MAX_CACHE_BYTES || 1536 * 1024 * 1024)); // 默认 1.5GB
 const AUDIO_CACHE_MIN_BYTES = 64 * 1024;    // 小于这个多半是错误响应，不落盘
 const DL_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -298,6 +299,11 @@ async function getMixinKey() {
 // ---------------------------------------------------------------------------
 // B 站接口封装
 // ---------------------------------------------------------------------------
+// B 站接口统一超时（评审共识 #2）：全项目有超时的 fetch 有好几处，
+// 唯独调用最频繁的这条主路径裸奔 —— 一条半开连接能把搜索/取流全部挂死，
+// 而 /api/health 不经过 B 站、恒返回正常，结果就是服务已经废了却没人发现。
+const BILI_TIMEOUT_MS = Number(process.env.BILI_TIMEOUT_MS || 10000);
+
 async function biliGetOnce(url, params, { signed = true, raw = false } = {}) {
   await ensureGuestIdentity();
   let full = url;
@@ -307,14 +313,22 @@ async function biliGetOnce(url, params, { signed = true, raw = false } = {}) {
       : new URLSearchParams(params).toString();
     full = url + '?' + qs;
   }
-  const res = await fetch(full, {
-    headers: {
-      'User-Agent': UA,
-      Referer: REFERER,
-      'Accept-Encoding': 'identity',
-      Cookie: cookieHeader(guestCookies),
-    },
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error(`B 站接口超时（${BILI_TIMEOUT_MS}ms）`)), BILI_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(full, {
+      headers: {
+        'User-Agent': UA,
+        Referer: REFERER,
+        'Accept-Encoding': 'identity',
+        Cookie: cookieHeader(guestCookies),
+      },
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.status === 412) throw new Error('B 站返回 412（风控），请稍后重试');
   if (raw) return res;
   const text = await res.text();
@@ -802,11 +816,26 @@ function extractLyricRaw(ldata) {
 // ---------------------------------------------------------------------------
 const STREAM_TIMEOUT_MS = 8000;
 
-async function tryStream(cdnUrl, req, res) {
+async function tryStream(cdnUrl, req, res, wantFull) {
   const headers = { 'User-Agent': UA, Referer: REFERER, 'Accept-Encoding': 'identity' };
   const ch = cookieHeader(guestCookies);
   if (ch) headers['Cookie'] = ch;
-  const range = req.headers['range'];
+  // 分片上限（评审 P1-1）：缓存命中那条路早就按 RANGE_CHUNK 截了，
+  // 但代理路径（缓存 miss）把客户端的 Range 原样透传 —— 无 Range / 开放右端时
+  // 上游会把整首（几十 MB）一口气吐回来，弱网下就是一场重传风暴。
+  // 现在与缓存路径对齐：默认截到 RANGE_CHUNK，播放器会自己带着新偏移回来；
+  // full=1（客户端分片下载器）不受限，它本来就会按 content-range 推进。
+  let range = req.headers['range'];
+  if (!wantFull) {
+    const m = /^bytes=(\d+)-(\d*)/.exec(range || '');
+    if (m) {
+      const s = Number(m[1]);
+      const e = m[2] === '' ? s + RANGE_CHUNK - 1 : Math.min(Number(m[2]), s + RANGE_CHUNK - 1);
+      range = `bytes=${s}-${e}`;
+    } else {
+      range = `bytes=0-${RANGE_CHUNK - 1}`;
+    }
+  }
   if (range) headers['Range'] = range;
 
   const ctrl = new AbortController();
@@ -878,12 +907,12 @@ async function tryStream(cdnUrl, req, res) {
 }
 
 // 返回 true=已成功开始响应；false=全部候选失败（响应头未发出时由调用方决定如何回错）
-async function proxyStream(candidates, req, res) {
+async function proxyStream(candidates, req, res, wantFull) {
   const errors = [];
   for (const url of candidates) {
     try {
       console.log(`[stream] trying ${url.slice(0, 60)}... range=${req.headers['range'] || '<none>'}`);
-      const done = await tryStream(url, req, res);
+      const done = await tryStream(url, req, res, wantFull);
       if (done) return true;
     } catch (e) {
       const msg = e && e.name === 'AbortError' ? 'timeout' : (e.message || String(e));
@@ -1002,29 +1031,60 @@ const FFMPEG_BIN = process.env.FFMPEG_BIN || '/usr/bin/ffmpeg';
 // 还留下了 406MB 的 .remux 残留）。同一文件同时只允许一个 ffmpeg。
 const remuxInFlight = new Set();
 
-async function remuxDashToFaststart(file) {
-  if (remuxInFlight.has(file)) return false;
-  let head;
+// 失败负标记（v1.3.0 · 评审 P0-5）：以前 ffmpeg 失败既没日志也没标记，
+// 下一次 /api/play 又会从头再试一遍 —— 同一个坏文件每小时能吃掉几十次
+// 180 秒的空等。现在失败记 24 小时，期间直接跳过（桌面端不受影响，
+// 这类文件本来就不是标准 MP4，重混失败多半是源流真的有问题）。
+const REMUX_FAIL_TTL = 24 * 3600 * 1000;
+const remuxFailAt = new Map();
+function remuxRecentlyFailed(file) {
+  const t = remuxFailAt.get(file);
+  if (!t) return false;
+  if (Date.now() - t > REMUX_FAIL_TTL) { remuxFailAt.delete(file); return false; }
+  return true;
+}
+
+function fileLooksDash(file) {
   try {
     const fd = fs.openSync(file, 'r');
     const buf = Buffer.alloc(64);
     fs.readSync(fd, buf, 0, 64, 0);
     fs.closeSync(fd);
-    head = buf;
+    return buf.includes(Buffer.from('dash'));
   } catch { return false; }
+}
+
+async function remuxDashToFaststart(file) {
+  if (remuxInFlight.has(file) || remuxRecentlyFailed(file)) return false;
   // 只处理 DASH 分片式文件；普通 MP4 原样返回
-  if (!head.includes(Buffer.from('dash'))) return false;
+  if (!fileLooksDash(file)) return false;
   remuxInFlight.add(file);
   try {
     const tmp = `${file}.${process.pid}.remux`;
     try { fs.unlinkSync(tmp); } catch {}
+    // -loglevel error：stderr 只留错误（以前全量进度输出，几 MB 的 stderr
+    // 直接把默认 1MB 的 maxBuffer 撑爆，node 会杀掉 ffmpeg —— 表现为重混
+    // 静默失败，没有任何日志，坏文件还留在缓存里被反复使用）。
+    // maxBuffer 提到 8MB 双保险；-nostdin 防止它挂在 stdin 上。
     const ok = await new Promise((resolve) => {
       try {
-        execFile(FFMPEG_BIN, ['-y', '-i', file, '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', tmp],
-          { timeout: 180000 }, (err) => resolve(!err));
-      } catch { resolve(false); }
+        execFile(FFMPEG_BIN,
+          ['-nostdin', '-loglevel', 'error', '-y', '-i', file, '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', tmp],
+          { timeout: 180000, maxBuffer: 8 * 1024 * 1024 },
+          (err, _so, se) => {
+            if (err) console.error(`[remux] 失败 ${path.basename(file)}: ${(se || err.message).slice(0, 200)}`);
+            resolve(!err);
+          });
+      } catch (e) {
+        console.error(`[remux] 启动失败: ${e.message}`);
+        resolve(false);
+      }
     });
-    if (!ok) { try { fs.unlinkSync(tmp); } catch {} return false; }
+    if (!ok) {
+      remuxFailAt.set(file, Date.now());
+      try { fs.unlinkSync(tmp); } catch {}
+      return false;
+    }
     try {
       const st = fs.statSync(tmp);
       if (st.size >= 64 * 1024) {
@@ -1034,6 +1094,7 @@ async function remuxDashToFaststart(file) {
       }
       fs.unlinkSync(tmp);
     } catch {}
+    remuxFailAt.set(file, Date.now());
     return false;
   } finally {
     remuxInFlight.delete(file);
@@ -1045,6 +1106,40 @@ async function remuxDashToFaststart(file) {
 // 下次播放（以及之后每次）就直接读本地文件了。
 const pendingDownloads = new Map();
 
+// 下载并发闸门 + 磁盘水位（评审共识 #3）：
+// 以前只按 cid 去重，没有全局上限 —— 在收藏夹里快速划过一排没缓存过的歌，
+// 就是 N 个并发几十 MB 的下载同时写盘；更糟的是磁盘写满之后，收藏夹的
+// JSON 写入也开始失败。现在：
+//   ① 最多同时 DL_CONCURRENCY 个下载在跑，排队的走队列（FIFO）；
+//   ② 下载前查磁盘剩余空间，低于 DL_MIN_FREE_BYTES 就不下载（缓存 miss 不致命，
+//     收藏写不进去才致命）。
+const DL_CONCURRENCY = Math.max(1, Number(process.env.DL_CONCURRENCY || 2));
+const DL_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024;   // 剩余 < 2GB 就不再往缓存里写
+const dlQueue = [];
+let dlActive = 0;
+
+function diskFreeBytes(dir) {
+  try {
+    const st = fs.statfsSync(dir);
+    return st.bsize * st.bavail;
+  } catch { return Number.MAX_SAFE_INTEGER; }   // statfs 不可用的平台当作无限
+}
+
+function scheduleDownload(run) {
+  return new Promise((resolve, reject) => {
+    const start = () => {
+      dlActive++;
+      run().then(resolve, reject).finally(() => {
+        dlActive--;
+        const next = dlQueue.shift();
+        if (next) next();
+      });
+    };
+    if (dlActive < DL_CONCURRENCY) start();
+    else dlQueue.push(start);
+  });
+}
+
 function downloadToCache(cid, candidates) {
   const key = String(cid);
   if (pendingDownloads.has(key)) return;
@@ -1054,31 +1149,39 @@ function downloadToCache(cid, candidates) {
     let saved = false;
     try {
       ensureAudioCacheDir();
-      for (const url of candidates.slice(0, 2)) {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(new Error('download timeout')), DL_TIMEOUT_MS);
-        try {
-          const up = await fetch(url, {
-            headers: { 'User-Agent': UA, Referer: REFERER, 'Accept-Encoding': 'identity' },
-            signal: ctrl.signal,
-          });
-          if (up.status !== 200 || !up.body) continue;
-          await pipeline(Readable.fromWeb(up.body), fs.createWriteStream(tmp));
-          const size = fs.statSync(tmp).size;
-          if (size >= AUDIO_CACHE_MIN_BYTES) {
-            fs.renameSync(tmp, file);
-            saved = true;
-            console.log(`[cache] saved cid=${cid} ${(size / 1048576).toFixed(1)}MB`);
-            await remuxDashToFaststart(file);
-            break;
-          }
-          console.warn(`[cache] too small (${size}B), skip`);
-        } catch (e) {
-          console.warn(`[cache] candidate failed: ${e.message}`);
-        } finally {
-          clearTimeout(timer);
-        }
+      // 磁盘水位：宁可放弃缓存（大不了现场代理），不能把盘写满拖垮收藏写入
+      const free = diskFreeBytes(AUDIO_CACHE_DIR);
+      if (free < DL_MIN_FREE_BYTES) {
+        console.warn(`[cache] 跳过下载：磁盘仅剩 ${(free / 1048576 / 1024).toFixed(1)}GB（阈值 2GB）`);
+        return;
       }
+      await scheduleDownload(async () => {
+        for (const url of candidates.slice(0, 2)) {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(new Error('download timeout')), DL_TIMEOUT_MS);
+          try {
+            const up = await fetch(url, {
+              headers: { 'User-Agent': UA, Referer: REFERER, 'Accept-Encoding': 'identity' },
+              signal: ctrl.signal,
+            });
+            if (up.status !== 200 || !up.body) continue;
+            await pipeline(Readable.fromWeb(up.body), fs.createWriteStream(tmp));
+            const size = fs.statSync(tmp).size;
+            if (size >= AUDIO_CACHE_MIN_BYTES) {
+              fs.renameSync(tmp, file);
+              saved = true;
+              console.log(`[cache] saved cid=${cid} ${(size / 1048576).toFixed(1)}MB (active=${dlActive}, queued=${dlQueue.length})`);
+              await remuxDashToFaststart(file);
+              break;
+            }
+            console.warn(`[cache] too small (${size}B), skip`);
+          } catch (e) {
+            console.warn(`[cache] candidate failed: ${e.message}`);
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+      });
       if (!saved) { try { fs.unlinkSync(tmp); } catch {} }
       sweepAudioCache();
     } catch (e) {
@@ -1155,8 +1258,16 @@ const RATE_BUCKETS = {
 const rateState = new Map(); // ip|kind -> { tokens, at }
 
 function clientIp(req) {
-  const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return xf || req.socket.remoteAddress || 'unknown';
+  const ra = req.socket.remoteAddress || 'unknown';
+  // X-Forwarded-For 只在「连接确实来自本机反代（Caddy）」时才信，而且取最后一跳：
+  // Caddy 会把真实客户端 IP 追加到末尾，攻击者自己伪造的前面几跳污染不了它。
+  // 以前无条件信任第一跳 —— 直连 8362 的任何人带个假 XFF 就能换着 IP 绕过限流。
+  const isLocal = ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1';
+  if (isLocal) {
+    const parts = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return ra;
 }
 
 function rateAllow(ip, kind) {
@@ -1215,25 +1326,127 @@ function newPlaylist(name) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 数据文件读写保护（v1.3.0 · 第二轮评审 P0-1/P0-2/P0-3）
+//
+// 以前的写法：readPlaylists 用一个无条件的 catch 把「文件不存在」「读不出来」
+// 「JSON 是半截的」全当成"重建"，然后 writePlaylists(新建空结构) 把原文件盖掉。
+// 后果：USB 盘抖一下读出 EIO、或者掉电落了个半截 JSON —— 用户恰好刷新一次页面，
+//       几十个收藏夹就没了，而且程序亲手销毁了唯一的现场。
+// 收藏夹是这个项目里唯一没有备份的数据，这个 catch 就是最危险的一行。
+//
+// 现在的原则：**只有"文件确实不存在"才允许重建**。
+// 读不出来 / 解析不了 -> ①改名隔离到 .corrupt-<时间戳> 保留现场 ②打日志
+//                       ③返回只读的空结构，并且**禁止本次进程做任何回写**。
+// 这样最坏情况只是"这次看起来是空的"，数据还在盘上，可以手工救回来。
+// ---------------------------------------------------------------------------
+const dataWritable = { playlists: true, history: true };
+let readonlyPlaylists = null;
+
+// P0-2：写入失败必须让用户知道。以前 writePlaylists/writeHistory 返回的 false
+// 被十几个调用点全部忽略 —— 前端收到 200 以为收藏上了，其实一个字节都没进盘。
+// 现在凡是写失败一律 503，前端可以明确提示"没保存成功"。
+function sendSaveFailed(res, what) {
+  return sendJson(res, 503, {
+    error: `${what}没能保存：数据文件当前不可写（源文件可能已损坏被隔离为 *.corrupt-*）。请到服务器上处理后重试。`,
+  });
+}
+
+function stamp() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+// 把坏文件挪到一边留证据，而不是原地覆盖
+function quarantineCorrupt(file, err) {
+  const dst = `${file}.corrupt-${stamp()}`;
+  try {
+    fs.renameSync(file, dst);
+    console.error(`[data] ${file} 无法解析（${err && err.message}），已隔离为 ${dst}；保留现场，不会自动重建。`);
+  } catch (e) {
+    // 挪不动（比如盘只读）也不能继续往下写，靠 writable 标志挡住
+    console.error(`[data] ${file} 无法解析且无法隔离（${e && e.code}），本次会话禁止写入。`);
+  }
+}
+
+// 落盘三件事：写 -> fsync 文件 -> rename -> fsync 目录。
+// rename 保证原子替换，但**内容真正进磁盘**需要 fsync；少了它，掉电后会留下半截文件，
+// 下次启动撞上这个半截文件 —— 正好串联成上面那个灾难（现在已经被 dWritable 挡住了，但还是要写对）。
+function writeFileFsync(file, content) {
+  const fd = fs.openSync(file, 'w');
+  try {
+    fs.writeFileSync(fd, content);
+    try { fs.fsyncSync(fd); } catch { /* 某些平台/文件系统不支持，能写多少算多少 */ }
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
+function fsyncDir(dir) {
+  let fd = null;
+  try {
+    fd = fs.openSync(dir, 'r');
+    try { fs.fsyncSync(fd); } catch {}
+  } catch { /* Windows 上目录 fsync 直接不支持 */ }
+  finally { if (fd !== null) { try { fs.closeSync(fd); } catch {} } }
+}
+
+// 只读兜底结构：进程内保持稳定，避免每次调用生成新 id
+function emptyPlaylists() {
+  if (!readonlyPlaylists) {
+    const pl = newPlaylist(DEFAULT_PL_NAME);
+    readonlyPlaylists = { version: 2, active: pl.id, order: [pl.id], lists: { [pl.id]: pl } };
+  }
+  return readonlyPlaylists;
+}
+
 function readPlaylists() {
   ensureDataDir();
+  let raw = null;
+  let readErr = null;
   try {
-    const data = JSON.parse(fs.readFileSync(PL_FILE, 'utf8'));
-    if (data && data.lists && typeof data.lists === 'object') {
-      if (!Array.isArray(data.order) || !data.order.length) data.order = Object.keys(data.lists);
-      data.order = data.order.filter((id) => data.lists[id]);
-      // 补齐历史上可能存在但不在 order 里的列表，避免“看不见但删不掉”
-      for (const id of Object.keys(data.lists)) if (!data.order.includes(id)) data.order.push(id);
-      if (!data.active || !data.lists[data.active]) data.active = data.order[0];
-      for (const id of data.order) {
-        const l = data.lists[id];
-        if (!Array.isArray(l.items)) l.items = [];
-      }
-      return data;
-    }
-  } catch { /* 文件不存在或损坏 -> 重建 */ }
+    raw = fs.readFileSync(PL_FILE, 'utf8');
+  } catch (e) {
+    readErr = e;
+  }
 
-  // 迁移旧版单收藏夹
+  // 情况一：读不出来。ENOENT = 确实没有（首次启动），其他错误 = 盘有问题。
+  if (raw === null) {
+    if (readErr && readErr.code !== 'ENOENT') {
+      dataWritable.playlists = false;
+      console.error(`[playlists] 读取失败（${readErr.code}），拒绝重建以免覆盖原数据。`);
+      return emptyPlaylists();
+    }
+    return migrateLegacyOrNew();
+  }
+
+  // 情况二：读出来了但解析不了 / 结构不对 —— 隔离后禁写，绝不重建
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    quarantineCorrupt(PL_FILE, e);
+    dataWritable.playlists = false;
+    return emptyPlaylists();
+  }
+  if (data && data.lists && typeof data.lists === 'object') {
+    if (!Array.isArray(data.order) || !data.order.length) data.order = Object.keys(data.lists);
+    data.order = data.order.filter((id) => data.lists[id]);
+    // 补齐历史上可能存在但不在 order 里的列表，避免"看不见但删不掉"
+    for (const id of Object.keys(data.lists)) if (!data.order.includes(id)) data.order.push(id);
+    if (!data.active || !data.lists[data.active]) data.active = data.order[0];
+    for (const id of data.order) {
+      const l = data.lists[id];
+      if (!Array.isArray(l.items)) l.items = [];
+    }
+    return data;
+  }
+  quarantineCorrupt(PL_FILE, new Error('顶层结构不符（缺 lists）'));
+  dataWritable.playlists = false;
+  return emptyPlaylists();
+}
+
+// 只在"两个数据文件都不存在"时才走：迁移旧版单收藏夹，或建一个空的默认收藏夹
+function migrateLegacyOrNew() {
   let legacy = [];
   try {
     const arr = JSON.parse(fs.readFileSync(LEGACY_FAV_FILE, 'utf8'));
@@ -1257,14 +1470,22 @@ function readPlaylists() {
 }
 
 function writePlaylists(data) {
+  if (!dataWritable.playlists) {
+    console.error('[playlists] 拒绝写入：原数据已隔离为 .corrupt-*，先手工确认再删掉它才会重建。');
+    return false;
+  }
   ensureDataDir();
   const lock = acquireDataLock('playlists');
   if (!lock) { console.warn('[playlists] 写入跳过：未能在 500ms 内拿到数据锁'); return false; }
   try {
     const tmp = `${PL_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    writeFileFsync(tmp, JSON.stringify(data, null, 2));
     fs.renameSync(tmp, PL_FILE);
+    fsyncDir(path.dirname(PL_FILE));
     return true;
+  } catch (e) {
+    console.error('[playlists] 写入失败：', e && e.message);
+    return false;
   } finally { releaseDataLock(lock); }
 }
 
@@ -1272,22 +1493,51 @@ function writePlaylists(data) {
 // 记 position 是为了"上次听到哪就从哪接着听"——手机场景真正需要的东西。
 function readHistory() {
   ensureDataDir();
+  let raw = null;
+  let readErr = null;
   try {
-    const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    raw = fs.readFileSync(HISTORY_FILE, 'utf8');
+  } catch (e) {
+    readErr = e;
+  }
+  if (raw === null) {
+    // 同样只有"确实是空的"才当空；读不出来时禁写，避免把续播记录用空数组盖掉
+    if (readErr && readErr.code !== 'ENOENT') {
+      dataWritable.history = false;
+      console.error(`[history] 读取失败（${readErr.code}），本次会话禁止写入以免覆盖原数据。`);
+    }
+    return { items: [] };
+  }
+  try {
+    const h = JSON.parse(raw);
     if (h && Array.isArray(h.items)) return h;
-  } catch { /* 没有或坏了就当空 */ }
+  } catch (e) {
+    quarantineCorrupt(HISTORY_FILE, e);
+    dataWritable.history = false;
+    return { items: [] };
+  }
+  quarantineCorrupt(HISTORY_FILE, new Error('顶层结构不符（缺 items）'));
+  dataWritable.history = false;
   return { items: [] };
 }
 
 function writeHistory(h) {
+  if (!dataWritable.history) {
+    console.error('[history] 拒绝写入：原数据已隔离为 .corrupt-*，先手工处理才会继续。');
+    return false;
+  }
   ensureDataDir();
   const lock = acquireDataLock('history');
   if (!lock) { console.warn('[history] 写入跳过：未能在 500ms 内拿到数据锁'); return false; }
   try {
     const tmp = `${HISTORY_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(h, null, 2));
+    writeFileFsync(tmp, JSON.stringify(h, null, 2));
     fs.renameSync(tmp, HISTORY_FILE);
+    fsyncDir(path.dirname(HISTORY_FILE));
     return true;
+  } catch (e) {
+    console.error('[history] 写入失败：', e && e.message);
+    return false;
   } finally { releaseDataLock(lock); }
 }
 
@@ -1390,11 +1640,28 @@ async function handleApi(req, res, url) {
   }
 
   if (p === '/api/health') {
-    return sendJson(res, 200, {
-      ok: true,
+    // health 必须说真话（评审 P2-13）：以前恒 ok:true —— B 站接口挂死、
+    // 磁盘写满、ffmpeg 不在，对外全是"健康"，坏一整天没人知道。
+    // 现在检查三件真正影响使用的事：磁盘可写性、剩余空间、ffmpeg 在不在。
+    // 注意它仍不主动打 B 站（探活不能被上游故障放大），B 站可用性看 bili 字段。
+    const checks = { diskWritable: false, diskFreeBytes: 0, ffmpeg: false };
+    try {
+      const probe = path.join(DATA_DIR, `.health-${process.pid}`);
+      fs.writeFileSync(probe, String(Date.now()));
+      fs.unlinkSync(probe);
+      checks.diskWritable = true;
+    } catch {}
+    checks.diskFreeBytes = diskFreeBytes(DATA_DIR);
+    if (checks.diskFreeBytes === Number.MAX_SAFE_INTEGER) checks.diskFreeBytes = -1;
+    checks.ffmpeg = fs.existsSync(FFMPEG_BIN);
+    const ok = checks.diskWritable && checks.diskFreeBytes > 512 * 1024 * 1024;
+    return sendJson(res, ok ? 200 : 503, {
+      ok,
       service: 'bili-music-web',
       features: ['history', 'prefetch', 'lyric-multi-source', 'audio-cache', 'rate-limit'],
       audioCache: audioCacheStats(),
+      checks,
+      bili: { note: '本接口不探测 B 站（探活不应被上游故障放大）；搜索/取流失败会在响应里体现' },
     });
   }
 
@@ -1480,7 +1747,7 @@ async function handleApi(req, res, url) {
       h.items = h.items.filter((x) => `${x.bvid}|${x.cid || 0}` !== key);
       h.items.unshift(entry);
       if (h.items.length > HISTORY_MAX) h.items = h.items.slice(0, HISTORY_MAX);
-      writeHistory(h);
+      if (!writeHistory(h)) return sendSaveFailed(res, '播放记录');
       return sendJson(res, 200, { items: h.items.slice(0, 1) });
     }
     if (req.method === 'DELETE') {
@@ -1490,7 +1757,7 @@ async function handleApi(req, res, url) {
         const key = q.get('key') || '';
         h.items = h.items.filter((x) => `${x.bvid}|${x.cid || 0}` !== key);
       }
-      writeHistory(h);
+      if (!writeHistory(h)) return sendSaveFailed(res, '播放记录');
       return sendJson(res, 200, { items: h.items });
     }
   }
@@ -1521,7 +1788,9 @@ async function handleApi(req, res, url) {
             size = cachedAudioSize(cid);
           }
         }
-        return sendJson(res, 200, { ok: true, cid, cached: size > 0, size });
+        // ok 必须如实：cached=false 却报 ok=true 的话，前端会把这首标记为
+        // 「已预热」，30 分钟内（playurl TTL）一直走最慢路径还不自知
+        return sendJson(res, 200, { ok: size > 0, cid, cached: size > 0, size });
       } catch (e) {
         return sendJson(res, 200, { ok: false, cid, cached: false, size: 0, error: e.message });
       }
@@ -1613,14 +1882,21 @@ async function handleApi(req, res, url) {
     const bvid = (q.get('bvid') || '').trim();
     const cid = Number(q.get('cid') || '0');
     if (!/^BV\w+$/i.test(bvid) || !cid) return sendJson(res, 400, { error: '参数缺失' });
+    // refresh=1：前端报告「拿不到音频」时主动要求作废直链缓存重取
+    //（B 站 CDN 直链失效的典型表现就是重连也 403/404）
+    if (q.get('refresh') === '1') playurlCache.delete(`${bvid}|${cid}`);
 
     // 本地有缓存：直读磁盘，不再打 B 站（二次播放基本是秒开）
-    // 懒迁移：历史上存的是 DASH fMP4（iOS 只认出 20s），先重混成 faststart 再 serve
+    // 懒迁移（v1.3.0 改后台）：以前这里 await 重混，iOS 的播放请求最长
+    // 卡 180 秒（ffmpeg 慢或挂了就一直等）。现在改为发现 DASH 就丢后台重混，
+    // 本次请求把原文件照常 serve（桌面端本来就播得了）；重混完成后播放器的
+    // 下一个 Range 请求自动落到 faststart 版本，iOS 下一次播放即正常。
     let size = cachedAudioSize(cid);
     if (size) {
-      try {
-        if (await remuxDashToFaststart(audioCacheFile(cid))) size = cachedAudioSize(cid);
-      } catch {}
+      const cacheFile = audioCacheFile(cid);
+      if (fileLooksDash(cacheFile) && !remuxRecentlyFailed(cacheFile)) {
+        remuxDashToFaststart(cacheFile).catch(() => {});   // 内部有 in-flight 去重
+      }
       console.log(`[play] local cache ${cid} (${(size / 1048576).toFixed(1)}MB)`);
       try {
         serveCachedAudio(req, res, cid, size, q.get('full') === '1');
@@ -1637,14 +1913,14 @@ async function handleApi(req, res, url) {
         res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end('no audio');
       }
-      let ok = await proxyStream(candidates, req, res);
+      let ok = await proxyStream(candidates, req, res, q.get('full') === '1');
       if (ok) downloadToCache(cid, candidates);   // 后台补一份本地副本，下次直接命中
       if (!ok) {
         // 缓存里的直链可能已过期/失效：作废缓存重新取一次，再试一轮
         console.log('[play] first round failed, refreshing playurl and retrying');
         playurlCache.delete(`${bvid}|${cid}`);
         candidates = await getAudioCandidates(bvid, cid);
-        if (candidates && candidates.length) ok = await proxyStream(candidates, req, res);
+        if (candidates && candidates.length) ok = await proxyStream(candidates, req, res, q.get('full') === '1');
       }
       if (!ok && !res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -1693,7 +1969,7 @@ async function handleApi(req, res, url) {
       data.lists[pl.id] = pl;
       data.order.push(pl.id);
       data.active = pl.id;
-      writePlaylists(data);
+      if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       return sendJson(res, 200, publicLists(data));
     }
 
@@ -1702,7 +1978,7 @@ async function handleApi(req, res, url) {
       const data = readPlaylists();
       if (body && body.active && data.lists[body.active]) {
         data.active = body.active;
-        writePlaylists(data);
+        if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
         return sendJson(res, 200, publicLists(data));
       }
       const id = body && body.id;
@@ -1710,7 +1986,7 @@ async function handleApi(req, res, url) {
       const name = String(body.name || '').trim().slice(0, 24);
       if (!name) return sendJson(res, 400, { error: '名称不能为空' });
       data.lists[id].name = name;
-      writePlaylists(data);
+      if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       return sendJson(res, 200, publicLists(data));
     }
 
@@ -1722,7 +1998,7 @@ async function handleApi(req, res, url) {
       delete data.lists[id];
       data.order = data.order.filter((x) => x !== id);
       if (data.active === id) data.active = data.order[0];
-      writePlaylists(data);
+      if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       return sendJson(res, 200, publicLists(data));
     }
   }
@@ -1752,7 +2028,7 @@ async function handleApi(req, res, url) {
       const at = list.items.findIndex((f) => itemKey(f) === key);
       if (at >= 0) return sendJson(res, 200, { id: list.id, name: list.name, items: list.items, duplicated: true });
       list.items.unshift(item);
-      writePlaylists(data);
+      if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       return sendJson(res, 200, { id: list.id, name: list.name, items: list.items });
     }
 
@@ -1780,7 +2056,7 @@ async function handleApi(req, res, url) {
       if (from !== to) {
         const [moved] = list.items.splice(from, 1);
         list.items.splice(to, 0, moved);
-        writePlaylists(data);
+        if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       }
       return sendJson(res, 200, { id: list.id, name: list.name, items: list.items });
     }
@@ -1792,7 +2068,7 @@ async function handleApi(req, res, url) {
       if (!list) return sendJson(res, 404, { error: '列表不存在' });
       const key = `${(q.get('bvid') || '').trim()}|${(q.get('cid') || '').trim()}`;
       list.items = list.items.filter((f) => itemKey(f) !== key);
-      writePlaylists(data);
+      if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       return sendJson(res, 200, { id: list.id, name: list.name, items: list.items });
     }
   }
@@ -1819,7 +2095,7 @@ async function handleApi(req, res, url) {
         list.items.push(item);
         added++;
       }
-      writePlaylists(data);
+      if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       console.log(`[playlists] bulk into ${list.name}: added=${added} skipped=${skipped}`);
       return sendJson(res, 200, { id: list.id, name: list.name, items: list.items, added, skipped });
     }
@@ -1839,7 +2115,7 @@ async function handleApi(req, res, url) {
       const key = itemKey(item);
       if (!list.items.find((f) => itemKey(f) === key)) {
         list.items.unshift(item);
-        writePlaylists(data);
+        if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       }
       return sendJson(res, 200, { favorites: list.items });
     }
@@ -1848,7 +2124,7 @@ async function handleApi(req, res, url) {
       const list = data.lists[data.active];
       const key = `${(q.get('bvid') || '').trim()}|${(q.get('cid') || '').trim()}`;
       list.items = list.items.filter((f) => itemKey(f) !== key);
-      writePlaylists(data);
+      if (!writePlaylists(data)) return sendSaveFailed(res, '收藏夹');
       return sendJson(res, 200, { favorites: list.items });
     }
   }
@@ -1856,25 +2132,49 @@ async function handleApi(req, res, url) {
   return sendJson(res, 404, { error: 'unknown api' });
 }
 
+// 请求体上限（评审 P1-11）：/api/login 免鉴权，以前一个 512MB 的 POST
+// 就能把进程内存打爆。本应用最大的合法请求体（收藏条目 JSON）也就几 KB，
+// 1MB 绰绰有余；超限直接 413 并掐断。
+const BODY_LIMIT = 1024 * 1024;
+
 function readBody(req) {
   return new Promise((resolve) => {
     let buf = '';
-    req.on('data', (c) => (buf += c));
+    let size = 0;
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      resolve(v);
+    };
+    req.on('data', (c) => {
+      if (done) return;
+      size += c.length;
+      if (size > BODY_LIMIT) {
+        try { req.destroy(); } catch {}
+        finish({});
+        return;
+      }
+      buf += c;
+    });
     req.on('end', () => {
+      if (done) return;
       const ct = String(req.headers['content-type'] || '');
       // 口令登录走的是普通表单提交（application/x-www-form-urlencoded）
       if (/application\/x-www-form-urlencoded/i.test(ct)) {
         const o = {};
         try { new URLSearchParams(buf).forEach((v, k) => { o[k] = v; }); } catch {}
-        return resolve(o);
+        return finish(o);
       }
       try {
-        resolve(buf ? JSON.parse(buf) : {});
+        finish(buf ? JSON.parse(buf) : {});
       } catch {
-        resolve({});
+        finish({});
       }
     });
-    req.on('error', () => resolve({}));
+    req.on('error', () => finish({}));
+    // 30 秒还传不完的请求体只有一种解释：有人在慢慢打 —— 丢弃
+    setTimeout(() => { try { req.destroy(); } catch {} finish({}); }, 30000).unref();
   });
 }
 
@@ -1969,6 +2269,27 @@ function tokenMatch(given, expected) {
   try { return crypto.timingSafeEqual(a, b); } catch { return false; }
 }
 
+// 登录失败锁定：连续 5 次错 → 锁 10 分钟（按 clientIp 记）
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_LOCK_MS = 10 * 60 * 1000;
+const loginFails = new Map();   // ip -> { n, until }
+function loginLocked(ip) {
+  const s = loginFails.get(ip);
+  if (!s) return false;
+  if (s.until) {
+    if (Date.now() < s.until) return true;
+    loginFails.delete(ip);      // 锁定期满，重新计数
+    return false;
+  }
+  return false;
+}
+function loginFail(ip) {
+  const s = loginFails.get(ip) || { n: 0, until: 0 };
+  s.n++;
+  if (s.n >= LOGIN_MAX_FAILS) { s.until = Date.now() + LOGIN_LOCK_MS; s.n = 0; console.warn(`[auth] ${ip} 连续口令错误，锁定 10 分钟`); }
+  loginFails.set(ip, s);
+}
+
 // 反代终止 TLS 时，node 这边看到的是 http，只能靠 X-Forwarded-Proto 判断
 function requestIsHttps(req) {
   const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
@@ -2045,11 +2366,20 @@ const server = http.createServer(async (req, res) => {
         res.setHeader('Retry-After', '10');
         return sendJson(res, 429, { error: '试得太快了，歇 10 秒' });
       }
+      // 登录失败锁定（评审 P1-10）：单口令体系里口令就是全部家当，
+      // 连续错 5 次锁 10 分钟，让在线爆破变得不现实。
+      const ip = clientIp(req);
+      if (loginLocked(ip)) {
+        res.setHeader('Retry-After', '600');
+        return sendJson(res, 429, { error: '错误次数太多，锁定 10 分钟' });
+      }
       const body = await readBody(req);
       if (tokenMatch(body.k, ACCESS_TOKEN)) {
+        loginFails.delete(ip);
         res.writeHead(303, { 'Set-Cookie': cookieAttrs(req), Location: `${BASE_PATH || ''}/` });
         return res.end();
       }
+      loginFail(ip);
       res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end('口令不对');
     }
@@ -2115,6 +2445,61 @@ try {
   console.warn('[cache] startup cleanup failed:', e.message);
 }
 
+// 定期维护（评审共识 #7）：LRU 原本只在「有新下载」和「启动时」才跑，
+// 一台常年开机的 NAS 上，缓存会一路涨到配额上限然后永远停在那儿占着盘；
+// 而半成品文件只有在下次启动时才清理 —— 崩一次留下几十 MB 垃圾，得等到
+// 重启才收得走。现在每 6 小时做三件事：
+//   ① 跑一遍 LRU（按 mtime 淘汰最久没听的）
+//   ② 清掉超过 1 小时没动静的 .part/.remux（别的实例正在用的跳过）
+//   ③ 修剪内存里的重混失败标记（Map 只增不减，长跑进程会一直涨）
+const MAINT_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const STALE_TEMP_MS = 60 * 60 * 1000;
+
+function sweepStaleTempFiles() {
+  let n = 0;
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(AUDIO_CACHE_DIR)) {
+      if (!/\.(part|remux|tmp)$/.test(f)) continue;
+      if (heldByOtherInstance(f)) continue;
+      const p = path.join(AUDIO_CACHE_DIR, f);
+      try {
+        const st = fs.statSync(p);
+        if (now - st.mtimeMs < STALE_TEMP_MS) continue;   // 还在写，别动
+        fs.unlinkSync(p);
+        n++;
+      } catch {}
+    }
+  } catch (e) { console.warn('[maint] stale temp cleanup failed:', e.message); }
+  return n;
+}
+
+const maintTimer = setInterval(() => {
+  try {
+    const stale = sweepStaleTempFiles();
+    const swept = sweepAudioCache();
+    let pruned = 0;
+    for (const [k, t] of remuxFailAt) {
+      if (Date.now() - t > REMUX_FAIL_TTL) { remuxFailAt.delete(k); pruned++; }
+    }
+    if (stale || swept.removed || pruned) {
+      console.log(`[maint] temp=${stale} swept=${swept.removed} negPruned=${pruned} -> ${swept.files} files / ${(swept.bytes / 1048576).toFixed(0)}MB`);
+    }
+  } catch (e) { console.warn('[maint] failed:', e.message); }
+}, MAINT_INTERVAL_MS);
+if (maintTimer.unref) maintTimer.unref();   // 不阻止进程退出
+
+// 鉴权 fail-closed（评审 P1-9）：独立端口模式（TCP 监听，会暴露到公网/局域网）
+// 若没设 ACCESS_TOKEN，整站就是无门状态 —— 以前只是控制台提一句，环境变量
+// 一丢（改 compose 忘了抄、systemd 单元被覆盖）鉴权就静默消失。
+// 现在：网关模式（SOCKET_PATH，由飞牛登录态保护）不受此限；直跑 TCP 必须
+// 显式设 ALLOW_NO_TOKEN=1 才允许无口令启动。
+if (!SOCKET_PATH && !ACCESS_TOKEN && process.env.ALLOW_NO_TOKEN !== '1') {
+  console.error('[boot] 拒绝启动：独立端口模式必须设置 ACCESS_TOKEN（访问口令）。');
+  console.error('       如果确实是纯内网临时调试，设 ALLOW_NO_TOKEN=1 可跳过此检查。');
+  process.exit(1);
+}
+
 if (SOCKET_PATH) {
   // 网关转发模式：监听 Unix Socket。残留的旧 socket 会让 listen 直接 EADDRINUSE，
   // 先清掉；chmod 666 是为了让网关进程（非本应用用户）也能连上来。
@@ -2125,6 +2510,6 @@ if (SOCKET_PATH) {
   });
 } else {
   server.listen(PORT, () => {
-    console.log(`[bili-music-web] listening on :${PORT} (data dir: ${DATA_DIR})`);
+    console.log(`[bili-music-web] listening on :${PORT} (data dir: ${DATA_DIR}${ACCESS_TOKEN ? ', token: on' : ', token: OFF(允许无口令模式)'})`);
   });
 }

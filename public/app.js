@@ -713,10 +713,21 @@ async function playIndex(idx, opts = {}) {
 // 失败也不阻塞播放 —— 只是退回原来的“边代理边播”路径。
 // ---------------------------------------------------------------------------
 const warmedDone = Object.create(null);
+// 预热失败回滚（评审 P1-2/P1-3）：以前失败也照样闩死（warmedDone 置位 /
+// warmedKey 不清），一首歌预热失败就 30 分钟锁死最慢路径，通勤时信号弱一下
+// 之后每首都得现场下载。现在失败只记 60 秒退避，之后自动重试。
+const warmFailAt = Object.create(null);
+const WARM_RETRY_MS = 60000;
+function warmBlocked(key) {
+  const t = warmFailAt[key];
+  if (!t) return false;
+  if (Date.now() - t > WARM_RETRY_MS) { delete warmFailAt[key]; return false; }
+  return true;
+}
 async function ensureWarm(item) {
   if (!item || !item.cid) return;
   const key = `${item.bvid}|${item.cid}`;
-  if (warmedDone[key]) return;
+  if (warmedDone[key] || warmBlocked(key)) return;
   const qs = `bvid=${encodeURIComponent(item.bvid)}&cid=${encodeURIComponent(item.cid)}&warm=1&wait=1`;
   const t0 = Date.now();
   try {
@@ -725,9 +736,15 @@ async function ensureWarm(item) {
     const r = await fetch(apiUrl(`/api/prefetch?${qs}`), { signal: ctrl.signal });
     clearTimeout(timer);
     const j = await r.json().catch(() => ({}));
+    if (j.ok === false || !j.cached) {
+      warmFailAt[key] = Date.now();     // 不闩死，60 秒后可重试
+      dlog('warm-fail', { cid: item.cid, cached: !!j.cached, err: String(j.error || '').slice(0, 60), ms: Date.now() - t0 });
+      return;
+    }
     warmedDone[key] = true;
     dlog('warm-resp', { cid: item.cid, cached: !!j.cached, size: j.size || 0, ms: Date.now() - t0 });
   } catch (e) {
+    warmFailAt[key] = Date.now();
     dlog('warm-err', { cid: item.cid, ms: Date.now() - t0, err: String(e).slice(0, 60) });
   }
 }
@@ -793,12 +810,26 @@ function prefetchNext(warm) {
     dlog('pf-send', { cid: n.cid, warm: false });
     fetch(apiUrl(`/api/prefetch?${qs}`)).catch(() => {});
   }
-  if (warm && n.cid && key !== warmedKey) {
+  if (warm && n.cid && key !== warmedKey && !warmBlocked(key)) {
     warmedKey = key;
     dlog('pf-send', { cid: n.cid, warm: true });
     fetch(apiUrl(`/api/prefetch?${qs}&warm=1`))
-      .then((r) => dlog('pf-resp', { cid: n.cid, warm: true, st: r.status }))
-      .catch((e) => dlog('pf-resp', { cid: n.cid, warm: true, err: String(e).slice(0, 60) }));
+      .then((r) => r.json().catch(() => ({})))
+      .then((j) => {
+        if (j && j.ok === false) {
+          // 服务端明确失败：回滚闩锁，下一轮 prefetchNext 还能再试
+          warmedKey = (warmedKey === key) ? '' : warmedKey;
+          warmFailAt[key] = Date.now();
+          dlog('pf-fail', { cid: n.cid, warm: true, err: String(j.error || 'ok:false').slice(0, 60) });
+          return;
+        }
+        dlog('pf-resp', { cid: n.cid, warm: true, cached: !!(j && j.cached) });
+      })
+      .catch((e) => {
+        warmedKey = (warmedKey === key) ? '' : warmedKey;   // 网络失败同样允许重试
+        warmFailAt[key] = Date.now();
+        dlog('pf-resp', { cid: n.cid, warm: true, err: String(e).slice(0, 60) });
+      });
     if (IS_REMOTE) {
       // 远程：不用备用元素（fMP4 + 隧道双坑），改预取整首字节，切歌秒开
       preloadNextRemote(n);
@@ -1007,6 +1038,13 @@ async function fetchBytesChunked(url, { onProgress, signal, parallel, big } = {}
       // 服务端仍可能把一块拆成多次吐（例如退回到 192KB 上限）：循环补齐这一块为止
       while (off <= be) {
         const r = await fetchRange(url, off, be, signal);
+        if (r.status !== 206) {
+          // 中间层忽略 Range 会回 200 全量：静默拼下去得到的是
+          // [首块, 整首, 整首…] 的坏数据，听感是杂音/卡死还查不出原因。
+          // 当场报错，让上层走兜底路径。
+          dlog('chunk-200', { at: off, st: r.status });
+          throw new Error('Range 被忽略(HTTP ' + r.status + ') @' + off);
+        }
         const b = new Uint8Array(await r.arrayBuffer());
         if (!b.length) throw new Error('空响应 @' + off);
         acc.push(b);
@@ -1068,9 +1106,13 @@ async function fetchChunked(item, url) {
 // 改成纯字节预取 —— 切歌时 blob 秒建，体验与局域网换元素相当。
 // ---------------------------------------------------------------------------
 let remotePreload = null;   // { key, parts }
+let remotePreloadFailAt = 0;
 function preloadNextRemote(n) {
   const key = `${n.bvid}|${n.cid}`;
   if (remotePreload && remotePreload.key === key) return;
+  // 失败退避（评审 P1-3）：以前预取一失败就永远不再试，之后每首都现场下载。
+  // 现在 60 秒后允许重试 —— 通勤时信号弱一下，出隧道还能恢复。
+  if (Date.now() - remotePreloadFailAt < WARM_RETRY_MS) return;
   const url = apiUrl(`/api/play?bvid=${encodeURIComponent(n.bvid)}&cid=${encodeURIComponent(n.cid)}&full=1`);
   const my = { key, parts: null };
   remotePreload = my;
@@ -1079,6 +1121,8 @@ function preloadNextRemote(n) {
     dlog('rp-ok', { cid: n.cid, bytes: partsBytes(parts), chunks: parts.length });
   }).catch((e) => {
     if (remotePreload === my) remotePreload = null;
+    remotePreloadFailAt = Date.now();
+    warmedKey = (warmedKey === key) ? '' : warmedKey;   // 允许下一轮重试
     dlog('rp-fail', { cid: n.cid, msg: String(e).slice(0, 60) });
   });
 }
@@ -1259,6 +1303,14 @@ function reportPosition(force) {
   const now = Date.now();
   if (!force && now - lastReportAt < 8000) return;
   lastReportAt = now;
+  // 退后台/锁屏瞬间（pagehide、visibilitychange=hidden）用 sendBeacon：
+  // iOS 在这两个时机基本不发普通 fetch（评审 P1-5），续播进度经常就这么丢了。
+  // sendBeacon 是浏览器承诺「页面死了也会发出去」的通道，正好用来做这件事。
+  const body = JSON.stringify({ item, position: A().currentTime || 0 });
+  const url = apiUrl('/api/history');
+  if (force && navigator.sendBeacon) {
+    try { navigator.sendBeacon(url, new Blob([body], { type: 'application/json' })); return; } catch {}
+  }
   apiSend('/api/history', 'POST', { item, position: A().currentTime || 0 }).catch(() => {});
 }
 
@@ -1292,24 +1344,65 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => reportPosition(true));
 
+// 断网恢复自动续播（评审 P1-6）：以前 online 事件只写日志 —— 地铁出隧道、
+// WiFi 切回蜂窝后音乐不会自己回来，锁屏下用户甚至不知道已经停了。
+// 只在「本来就该在放」（wantPlay）时才接，用户手动暂停的不算。
+window.addEventListener('online', () => {
+  dlog('net:online');
+  if (wantPlay && A().src && A().paused) {
+    dlog('net:resume');
+    A().play().catch(() => armAutoResume());
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 播放失败自动恢复：移动网络下 CDN 断流很常见，error 后带断点重连（最多 2 次）
 // ---------------------------------------------------------------------------
 let audioRetry = 0;
 onA('playing', () => { audioRetry = 0; });
+// 错误要分类说人话（评审 P1-7）：以前一律「网络抖动，再点一次」——
+// B 站风控 412 时引导用户反复点 = 越点越糟；解码错误重试一百次也没用。
+function mediaErrText(code) {
+  switch (code) {
+    case 1: return '播放被打断';
+    case 2: return '网络中断';
+    case 3: return '音频解码失败（文件可能不完整，去服务端缓存里删掉这首可恢复）';
+    case 4: return '拿不到音频（可能触发 B 站风控，或这首没有单独音轨）';
+    default: return '播放出错';
+  }
+}
 onA('error', () => {
   const item = queue[current];
   if (!item || !item.cid || !A().src) return;
-  if (audioRetry >= 2) {
+  const code = A().error && A().error.code;
+  dlog('a-err', { code, msg: (A().error && A().error.message || '').slice(0, 60) });
+  // 解码错误（3）：源文件坏了，重试同一份没有意义，直接停并说清楚
+  if (code === 3) {
+    pauseByUser('decode-err');
+    toast(mediaErrText(3));
+    return;
+  }
+  // 拿不到资源（4）：多半是 B 站风控/直链失效 —— 自动重试一次（服务端会刷直链），
+  // 但文案要引导等一等，而不是「再点一次」
+  const maxRetry = code === 4 ? 1 : 2;
+  if (audioRetry >= maxRetry) {
     setPlayIcon(false);
-    toast('网络不稳，点一下 ▶ 再试试');
+    toast(code === 4
+      ? '取不到音频，等一两分钟再试（B 站风控通常很快解除）'
+      : '网络不稳，点一下 ▶ 再试试');
     return;
   }
   audioRetry++;
   const el = A();
   const resumeAt = el.currentTime || 0;
-  toast(`网络抖动，自动重连（${audioRetry}/2）…`);
-  el.src = apiUrl(`/api/play?bvid=${encodeURIComponent(item.bvid)}&cid=${item.cid}&_r=${Date.now()}`);
+  toast(`${mediaErrText(code)}，自动重连（${audioRetry}/${maxRetry}）…`);
+  if (code === 4) {
+    // 让服务端作废 playurl 缓存重新取直链：加 _r 已经换 URL，服务端 playurlCache
+    // 按 bvid|cid 键 —— 失效直链的典型表现就是重连也 403，这里靠服务端重取
+    el.src = apiUrl(`/api/play?bvid=${encodeURIComponent(item.bvid)}&cid=${item.cid}&refresh=1&_r=${Date.now()}`);
+  } else {
+    el.src = apiUrl(`/api/play?bvid=${encodeURIComponent(item.bvid)}&cid=${item.cid}&_r=${Date.now()}`);
+  }
   el.load();
   const onMeta = () => {
     el.removeEventListener('loadedmetadata', onMeta);
@@ -1402,8 +1495,8 @@ function updateMediaSession(item) {
         } catch {}
       });
       navigator.mediaSession.setActionHandler('stop', () => {
-        try { A().pause(); A().currentTime = 0; } catch {}
-        setPlayIcon(false);
+        try { A().currentTime = 0; } catch {}
+        pauseByUser('ms-stop');   // 锁屏「停止」同样要清 wantPlay
       });
     } catch {}
   } catch {}
@@ -1449,15 +1542,25 @@ $('#playBtn').addEventListener('click', () => {
     wantPlay = true;
     A().play().then(() => { setPlayIcon(true); stopResumeRetry(); }).catch(() => armAutoResume());
   } else {
-    wantPlay = false;
-    stopResumeRetry();
-    A().pause();
-    setPlayIcon(false);
+    pauseByUser('tap');
   }
 });
 
-$('#prevBtn').addEventListener('click', () => playIndex(current - 1));
-$('#nextBtn').addEventListener('click', () => playIndex(current + 1));
+// 「暂停」必须统一走这里 —— 只 pause() 不清 wantPlay，回到前台会被自动续播：
+// 睡眠定时到点后第二天一开 app 音乐自己响起来，就是这个洞（wantPlay 还挂着 true）。
+function pauseByUser(reason) {
+  wantPlay = false;
+  stopResumeRetry();
+  try { A().pause(); } catch {}
+  setPlayIcon(false);
+  if (reason) dlog('pause-by-user', { reason });
+}
+
+// 界面上的上一首/下一首也必须走 advance()/retreat()，不能自己算索引 ——
+// 理由和上面锁屏那段注释一样（单曲循环会跳歌、随机不对、队尾静默没反应）。
+// 以前这里写的是 playIndex(current±1)，锁屏做对了而界面没跟上。
+$('#prevBtn').addEventListener('click', () => retreat('btn'));
+$('#nextBtn').addEventListener('click', () => advance('btn'));
 
 onA('play', () => { setPlayIcon(true); setMSPlaybackState('playing'); });
 onA('pause', () => { setPlayIcon(false); setMSPlaybackState('paused'); });
@@ -1540,6 +1643,40 @@ async function advanceInner() {
   }
 }
 
+// 「上一首」：和 advance 对称的一套。以前界面按钮直接 playIndex(current-1)，
+// 顺序模式到第一首点了没反应、列表循环不会绕回最后一首、随机也失效。
+async function retreat(reason) {
+  dlog('retreat', { reason, from: current, mode: playMode, qlen: queue.length });
+  if (advancing) return;
+  advancing = true;
+  try { await retreatInner(); } catch (e) {
+    dlog('retreat-err', { msg: String((e && e.message) || e).slice(0, 60) });
+  } finally { advancing = false; }
+}
+
+async function retreatInner() {
+  const len = queue.length;
+  if (!len) return;
+  queueEnded = false;
+  if (playMode === 'single') {
+    A().currentTime = 0;
+    await A().play().catch(() => armAutoResume());
+    return;
+  }
+  if (playMode === 'shuffle') {
+    const idx = pickShuffle();
+    if (idx < 0) { setPlayIcon(false); return; }
+    await playIndex(idx);
+    return;
+  }
+  if (playMode === 'loop') {
+    await playIndex((current - 1 + len) % len);
+    return;
+  }
+  if (current - 1 >= 0) await playIndex(current - 1);
+  else toast('已经是第一首了');
+}
+
 // ---------------------------------------------------------------------------
 // 诊断接线：媒体事件 + 每秒心跳 + 每 5 秒上报（DIAG_ON 时才挂）
 // 心跳是关键：如果后台心跳断了，就证明 iOS 把页面 JS 整个挂起了 —— 那时
@@ -1573,7 +1710,6 @@ if (DIAG_ON) {
   setInterval(() => dlog('tick'), 1000);
   setInterval(() => flushDiag(false), 5000);
   window.addEventListener('pagehide', () => { dlog('pagehide'); flushDiag(true); });
-  window.addEventListener('online', () => dlog('net:online'));
   window.addEventListener('offline', () => dlog('net:offline'));
 
   // ?diag=1 时显示"导出诊断日志"按钮：点了会立刻上传并尝试复制到剪贴板
@@ -1638,8 +1774,7 @@ function tickSleep() {
   const left = Math.max(0, sleepEndAt - Date.now());
   if (left <= 0) {
     setSleep(0);
-    A().pause();
-    setPlayIcon(false);
+    pauseByUser('sleep');   // 必须清 wantPlay，否则下次打开 app 会从昨天的进度自动放起来
     toast('睡眠定时到，已停止播放');
     return;
   }
