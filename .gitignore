@@ -22,6 +22,9 @@ node_modules/
 .DS_Store
 Thumbs.db
 
-# 发布流程产物（GitHub PAT 与发布配置，绝不入库）
+# 发布流程产物（GitHub PAT / 发布配置 / 脚本日志，绝不入库）
 _gh_token.txt
+_gh_cookies.txt
 oss-release.json
+_gh_*.txt
+_gh_*.json

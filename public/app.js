@@ -28,6 +28,53 @@ const audioEls = [$('#audio'), $('#audio2')];
 let audioIdx = 0;
 const A = () => audioEls[audioIdx];
 const B = () => audioEls[1 - audioIdx];
+
+// ---------------------------------------------------------------------------
+// iOS 播放解锁（2026-10-17 真机事故修复：老汪反馈「一点都播放不了」）
+//
+// 现象：iPhone 上点了歌毫无反应。服务端日志显示 206 一片片都在往外发，
+//   数据链路完全正常；客户端诊断日志里 play-fail 全是 **NotAllowedError**。
+// 根因：iOS Safari 要求 play() 必须在**用户手势的同步调用栈**里发起。
+//   而 playIndex() 是 async —— 中间要 await ensureWarm() 预热、
+//   await fetchChunked() 把整首拉成 blob，等拿到 src 再调 play() 时，
+//   用户激活早已失效，必被拒绝。页面刚打开时第一次点歌 100% 中招；
+//   之后 armAutoResume() 的定时重试同样不在手势内，于是永远起不来。
+// 解法：在任何触摸/点击的**捕获阶段**（同步、早于业务 handler）先让每个
+//   <audio> 真的出声一次 —— 没有 src 就临时挂一段静音 wav。元素一旦在手势内
+//   play() 过，后续对它的异步 play() 就被放行（iOS 的授权是 per-element 的）。
+// ---------------------------------------------------------------------------
+const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAAAAAA==';
+function unlockAudioEl(el) {
+  if (!el) return;
+  if (el._iosUnlocked) return;
+  try {
+    // 只有「空着」的元素才需要垫静音源；已经在预载下一首的元素不能动它的 src
+    if (!el.src) el.src = SILENT_WAV;
+    const p = el.play();          // ⚠️ 必须同步调用，绝不能 await
+    if (p && p.then) {
+      p.then(() => {
+        el._iosUnlocked = true;
+        // 静音 wav 只是敲门砖：出过声就立刻还原成空元素。
+        // 不清的话备用元素会一直挂着一个「有 src、readyState Ready」的假象，
+        // 被其它逻辑（换元素判断、诊断取元素）误认成已经缓冲好的一首。
+        setTimeout(() => {
+          try {
+            if (el.src === SILENT_WAV) { el.pause(); el.removeAttribute('src'); el.load(); }
+          } catch {}
+        }, 0);
+      }).catch(() => {});
+    } else {
+      el._iosUnlocked = true;
+    }
+  } catch {}
+}
+['touchend', 'pointerdown', 'click'].forEach((n) => {
+  document.addEventListener(n, () => {
+    // ⚠️ 只解锁「空着」的元素。带 src 的那个要么是正在播、要么是预载着下一首，
+    //    对它调 play() 会真的放出声音，绝对不能碰。
+    audioEls.forEach((el) => { if (!el.src) unlockAudioEl(el); });
+  }, { capture: true, passive: true });
+});
 // 只在「当前在播的元素」上生效的事件绑定：备用元素里的预载事件不干扰 UI
 function onA(ev, fn) {
   audioEls.forEach((el) => el.addEventListener(ev, () => { if (el === A()) fn(); }));
@@ -695,6 +742,10 @@ async function playIndex(idx, opts = {}) {
     // 系统（尤其 iOS 后台）拒绝了这次自动播放：不要只弹提示，挂自动重试，
     // 回到前台 / 系统放行时会自己接着播。
     armAutoResume();
+    // 但 NotAllowedError 是「没拿到用户手势」——定时器重试同样不在手势内，
+    // 干等 48 秒到 armGestureResume 是纯浪费（真机日志：连试 11 次全被拒）。
+    // 这种错直接把「轻点屏幕继续播放」摆出来，用户碰一下立刻就响。
+    if (e && e.name === 'NotAllowedError') armGestureResume();
   }
   // 新的一首已经出声，这时才停旧元素 —— 保证整个过程声音从没断过
   if (oldEl) { try { oldEl.pause(); oldEl.removeAttribute('src'); oldEl.load(); } catch {} }
