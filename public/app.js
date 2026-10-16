@@ -43,7 +43,7 @@ const B = () => audioEls[1 - audioIdx];
 //   <audio> 真的出声一次 —— 没有 src 就临时挂一段静音 wav。元素一旦在手势内
 //   play() 过，后续对它的异步 play() 就被放行（iOS 的授权是 per-element 的）。
 // ---------------------------------------------------------------------------
-const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAAAAAA==';
+const SILENT_WAV = 'data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA==';
 function unlockAudioEl(el) {
   if (!el) return;
   if (el._iosUnlocked) return;
@@ -51,6 +51,10 @@ function unlockAudioEl(el) {
     // 只有「空着」的元素才需要垫静音源；已经在预载下一首的元素不能动它的 src
     if (!el.src) el.src = SILENT_WAV;
     const p = el.play();          // ⚠️ 必须同步调用，绝不能 await
+    // 把这次 play() 挂到元素上：调用方（playIndex）换 src 之前要等它 settle。
+    // 不等的话「垫静音源 → 同一/邻近 tick 就换 src」会以 AbortError 收场，
+    // 元素实际从没播出过声 = 没解锁，iOS 之后照样拒。
+    if (p && p.then) el._unlockP = p;
     if (p && p.then) {
       p.then(() => {
         el._iosUnlocked = true;
@@ -609,6 +613,20 @@ async function playIndex(idx, opts = {}) {
   let playIdx = idx;
   let item = queue[idx];
 
+  // iOS 解锁的手势前提：触摸捕获阶段给空元素垫的静音源，必须「真的播出过声」
+  // 才算解锁成功。这里在动任何 src 之前等它 settle —— 否则换 src 会把那次
+  // play() 中断成 AbortError，元素等于没解锁，后面 await 之后的 play() 照样被拒。
+  // ⚠️ 只在真的有未 settle 的解锁时才让出控制权：正常播放时同步返回，
+  //    以免把「换元素时同步 play()」这条路推出手势栈。
+  const pendingUnlock = audioEls.filter((el) => el.src === SILENT_WAV && el._unlockP);
+  if (pendingUnlock.length) {
+    await Promise.race([
+      // 最多等 300ms：等不到就照常往下走，绝不能把整条播放链路挂住
+      Promise.all(pendingUnlock.map((el) => el._unlockP.catch(() => {}))),
+      new Promise((r) => setTimeout(r, 300)),
+    ]);
+  }
+
   // 还没解析过的视频先 resolve；遇到多P合辑或B站合集就把整份列表展开进队列
   if (!item.cid) {
     toast('加载中…');
@@ -690,8 +708,13 @@ async function playIndex(idx, opts = {}) {
       pendingStart = 0;
     }
   } else {
-    // 备用元素里不是这一首 → 停掉它的下载，别白耗流量
-    if (bx.src) { try { bx.pause(); bx.removeAttribute('src'); bx.load(); } catch {} }
+    // 备用元素里不是这一首 → 停掉它的下载，别白耗流量。
+    // ⚠️ 但若它此刻挂着的是 iOS 解锁用的那几毫秒静音 wav，绝不能在这里拆：
+    //    那次 play() 是同一个 tick 才发起的，拆掉 = AbortError = B 永远解锁不了。
+    //    而 B 正是「预载好下一首、结尾无缝换元素」用的那个 ——
+    //    后台自动连播（没有用户手势）能不能出声就靠它已经解锁。
+    //    静音 wav 由 unlockAudioEl 自己的 setTimeout 收拾，不会赖着不走。
+    if (bx.src && bx.src !== SILENT_WAV) { try { bx.pause(); bx.removeAttribute('src'); bx.load(); } catch {} }
     // 上一首播放期间已经把这一首整段拉到内存了 → 直接建 blob，零网络零等待。
     // 这条路径是 iOS 后台连播的关键：切歌时不发任何 fetch、不碰媒体栈，
     // 只换一个内存 blob，页面即便被系统挂起也不会卡住。
